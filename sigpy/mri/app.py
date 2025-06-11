@@ -8,7 +8,7 @@ from sigpy.mri import linop, nlop
 from sigpy.mri.dims import *
 
 __all__ = ['SenseRecon', 'L1WaveletRecon', 'TotalVariationRecon',
-           'JsenseRecon', 'EspiritCalib', 'HighDimensionalRecon',
+           'JsenseRecon', 'EspiritCalib', 'SakeWithInitialValue', 'HighDimensionalRecon',
            'ModelDiffRecon']
 
 
@@ -517,8 +517,14 @@ class EspiritCalib(sp.app.App):
         num_coils = len(ksp)
         with sp.get_device(ksp):
             # Get calibration region
-            calib_shape = [num_coils] + [calib_width] * img_ndim
+            if isinstance(calib_width, list) and len(calib_width)==3:
+                calib_shape = [num_coils] + calib_width
+            elif isinstance(calib_width, int):
+                calib_shape = [num_coils] + [calib_width] * img_ndim
+            else:
+                raise TypeError("calib_width must be either a three entry list or an integer")
             calib = sp.resize(ksp, calib_shape)
+            print(calib.shape)
             calib = sp.to_device(calib, device)
 
         xp = self.device.xp
