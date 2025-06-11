@@ -4,9 +4,10 @@ with an focus on diffusion tensor/kurtosis imaging.
 
 Author:
     Zhengguo Tan <zhengguo.tan@gmail.com>
+    Julius Glaser <julius-glaser@gmx.de>
 """
 import numpy as np
-from sigpy import fourier
+from sigpy import fourier, util, block
 
 MIN_POSITIVE_SIGNAL = 0.0001
 
@@ -24,6 +25,7 @@ def phase_corr(kdat, pcor, topup_dim=-11):
 
     Reference:
         Ehses P. https://github.com/pehses/twixtools
+        Ahn, Cho A New Phase Correction Method in NMR Imaging Based on Autocorrelation and Histogram Analysis
     """
     col_dim = -1
 
@@ -32,6 +34,7 @@ def phase_corr(kdat, pcor, topup_dim=-11):
 
     # if three lines are present,
     # average the 1st and the 3rd line.
+    # "Robust EPI Phase Correction O. Heid"
     if npcl == 3:
         pcors = np.swapaxes(pcor, 0, topup_dim)
         pcor1 = pcors[[0, 2], ...]
@@ -53,13 +56,318 @@ def phase_corr(kdat, pcor, topup_dim=-11):
     x = np.arange(ncol) - ncol//2
 
     pcor_fac = np.exp(1j * slope * x)
-
     kdat_img *= pcor_fac
     kdat_img = kdat_img.sum(topup_dim, keepdims=True)
     output = fourier.fft(kdat_img, axes=[-1])
 
     return output
 
+def SAKE_ref_correction(kdat_ref, calib_shape, 
+                        kSize=[3,3], 
+                        threshold_SAKE=4, 
+                        nIter=30, 
+                        threshold_PSI_calc = 0.0015, 
+                        radius_PSI_calc = 0.25):
+    """perform phase correction using the SAKE method proposed by Lyu.
+
+    Args:
+        kdat_ref (array): k-space data of the already simply corrected references
+        calib_shape (list or int): shape of the calibration area
+        kSize (list): shape of the SAKE kernel
+        threshold_SAKE (int): number of singular values to keep in SAKE
+        nIter (int): number of iterations to run SAKE
+        threshold_PSI_calc (float): threshold for masking of phase correlation matrix in Psi calculation in phase alignment
+        radius_PSI_calc (float): frequency limit from k-space center to be used in estimation of Psi in phase alignment
+
+    Output:
+        phase-corrected, resized references in k-space
+
+    Author:
+        Julius Glaser <julius-glaser@gmx.de>
+
+    Reference:
+        Lyu, Barth, Xie, Liu, Ma, Deng, Wu
+        Robust SENSE reconstruction of simultaneous multislice EPI with low-rank 
+        enhanced coil sensitivity calibration and slice-dependent 
+        2D Nyquist ghost correction
+        DOI: https://doi.org/10.1002/mrm.27120
+        Code: https://github.com/mylyu/SMS-EPI-Ghost-Correction
+
+        TODO: multishot support
+    """
+
+    assert (len(kdat_ref.shape) == 4 or len(kdat_ref.shape) == 3), \
+    "kdat_ref must be either 3 dimensional (Nx, Ny, Nch) or 4 dimensional (Nx, Ny, Nsli, Nch)"
+
+    if len(kdat_ref.shape) == 4:
+         Nx, Ny, Nsli, Ncha = kdat_ref.shape
+    else:
+         Nx, Ny, Ncha = kdat_ref.shape
+         Nsli = 1
+
+    if isinstance(calib_shape, list) and len(calib_shape)==2:
+        n_calib_shape = calib_shape + [Ncha]
+    elif isinstance(calib_shape, int):
+        n_calib_shape = [calib_shape]*2 + [Ncha]
+    else:
+        raise TypeError("calib_width must be either a 2 entry list or an integer")
+
+    calib_SAKE = []
+    # run SAKE seperatly for each slice
+    for i in range(Nsli):
+        print('>> slice number ', i)
+        if Nsli > 1:
+            data = kdat_ref[:, :, i, :]
+        else:
+            data = kdat_ref
+
+        # resize data to get only calib region in the center
+        calib = util.resize(data, n_calib_shape)
+
+        # join calib region twice as virtual channels and shift the higher channels to 
+        # use the same mask for positive and negative echos
+        calib_vc = np.concatenate((calib, np.roll(calib, shift=-1, axis=-2)), axis=-1)
+
+        # mask for positive and negative echos is the same due to shifting before
+        mask = np.zeros_like(calib_vc)
+        mask[:,0::2,:] += 1
+
+
+        res = SAKEwithInitialValue(calib_vc, mask, kSize, threshold_SAKE, nIter)
+
+        # reverse shifting from before
+        res[:,:, Ncha:] = np.roll(res[:,:, Ncha:], shift=1, axis=-2)
+
+        # add positive and negative estimated echos together without signal cancellation
+        calib_SAKE.append(pos_neg_add(res[:,:, 0:Ncha], res[:,:, Ncha:], threshold_PSI_calc, radius_PSI_calc))
+
+    # bring calculated references in shape Ncha, Nsli, Ny, Nx and zero fill
+    calib_SAKE = np.array(calib_SAKE)
+    calib_SAKE = np.transpose(calib_SAKE, (-1, 0, 2, 1))
+    calib_SAKE_zf = util.resize(calib_SAKE, [Ncha, Nsli, Ny, Nx])
+
+    return calib_SAKE_zf 
+
+def SAKEwithInitialValue(DATA, mask, kSize, wnRank, nIter):
+    """perform SAKE for already initial corrected EPI data split in negative and positvie echos.
+       This is effectively the python implementation of the matlab function SAKEwithInitialValue by Lyu
+
+    Args:
+        DATA (array): k-space data of the calibration area with pos and neg echos as virtual channels
+        mask (array): mask of pos and neg echos (same mask for both as neg are shifted before)
+        kSize (list): shape of the SAKE kernel
+        wnRank (int): number of singular values to keep in SAKE
+        nIter (int): number of iterations to run SAKE
+
+    Output:
+        estimated and filled virtual channels of pos and neg echos
+
+    Author:
+        Julius Glaser <julius-glaser@gmx.de>
+
+    Reference:
+        Lyu, Barth, Xie, Liu, Ma, Deng, Wu
+        Robust SENSE reconstruction of simultaneous multislice EPI with low-rank 
+        enhanced coil sensitivity calibration and slice-dependent 
+        2D Nyquist ghost correction
+        DOI: https://doi.org/10.1002/mrm.27120
+
+        Shin, Larson, Ohliger, Elad, Pauly, Vigneron, Lustig
+        Calibrationless parallel imaging reconstruction based on structured 
+        low-rank matrix completion
+        DOI: https://doi.org/10.1002/mrm.24997
+
+        Code: https://github.com/mylyu/SMS-EPI-Ghost-Correction
+
+        TODO: multishot support
+    """
+    sx, sy, sc = DATA.shape
+    res = DATA
+
+    for i in range(nIter):
+        tmp = block.array_to_blocks(res, kSize + [1],[1]*3)
+        block_1, block_2, block_3, _,_,_ = tmp.shape
+        tmp = np.reshape(tmp, (block_1*block_2, block_3, np.prod(kSize)), order='F')
+        tmp = np.swapaxes(tmp, -2, -1)
+        tsx, tsy, tsz = tmp.shape
+        A = np.reshape(tmp, (tsx, tsy*tsz), order='F')
+
+        # Perform SVD on calibration matrix and keep up to wnRank the singular values
+        U, S, VH = np.linalg.svd(A, full_matrices=False)
+        keep = np.arange(0, int(np.floor(wnRank * np.prod(kSize))))  # 0-based indexing
+        S_keep = np.diag(S[keep])
+
+        A = U[:, keep] @ S_keep @ VH[keep, :]
+
+        # Enforce Hankel structure
+        A = np.reshape(A,(tsx,tsy,tsz), order='F')
+
+        A = np.swapaxes(A, -2, -1)
+        A = np.reshape(A, (block_1, block_2, block_3, kSize[0], kSize[1], 1), order='F')
+        # # print(A.shape)
+        tmp = block.blocks_to_array(A, (sx, sy, sc), kSize + [1],[1]*3)
+
+        # calculate weight map for normalization as in matlab code
+        ones_blocks = np.ones_like(A)
+        weight_map = block.blocks_to_array(ones_blocks, (sx, sy, sc), kSize + [1],[1]*3)
+
+        normalized_tmp = np.divide(
+            tmp,
+            weight_map,
+            out=np.zeros_like(tmp),
+            where=weight_map != 0
+        )
+
+        #IFFT of tmp
+        # assume only one shot
+        N_virtual_coils = sc
+
+        img_1 = fourier.ifft(normalized_tmp[:,:,0:N_virtual_coils//2], axes=(0,1), norm=None)
+        img_1 *= np.sqrt(sx*sy)
+        img_2 = fourier.ifft(normalized_tmp[:,:,N_virtual_coils//2::], axes=(0,1), norm=None)
+        img_2 *= np.sqrt(sx*sy)
+
+        #mean of two virtual channels
+        mean_abs = (abs(img_1) + abs(img_2))/2
+
+        #FFT
+        tmp = fourier.fft(np.concatenate((mean_abs*np.exp(1j*np.angle(img_1)), mean_abs*np.exp(1j*np.angle(img_2))), axis=-1), axes=(0,1))
+        
+        # enforce data consistency
+        res = tmp*(1-mask) + DATA*mask
+        
+    return res
+
+def pos_neg_add(a, b, threshold = 0.0015, radius = 0.25):
+    """Add SAKE filled positive and negative echo images without signal cancellation.
+
+    Args:
+        a (array): positive echo image
+        b (array): negative echo image
+        threshold (float): threshold for masking of phase correlation matrix in Psi calculation
+        radius (float): frequency limit from k-space center to be used in estimation of Psi
+
+    Output:
+        combined echo image
+
+    Author:
+        Julius Glaser <julius-glaser@gmx.de>
+
+    Reference:
+        Hoge, Kraft
+        Robust EPI Nyquist ghost elimination via spatial and temporal encoding
+        DOI: https://doi.org/10.1002/mrm.22564
+    """
+
+    # Calculation of Psi and application has to be done in image space 
+    # (shift in k-space is linear phase in image space)
+    coil_imgs_a = fourier.ifft(a, axes=(0,1))
+    coil_imgs_b = fourier.ifft(b, axes=(0,1))
+
+    out = np.zeros_like(a)
+    Ncha = out.shape[-1]
+
+    for iCha in range(Ncha):
+        coil_img_a = coil_imgs_a[:,:,iCha]
+        coil_img_b = coil_imgs_b[:,:,iCha]
+
+        # calculate Psi for phase alignment as described in reference
+        Psi = calc_phase_align_matrix(coil_img_a, coil_img_b, threshold, radius)
+
+        # align phase of b to image a
+        coil_img_b_corr = coil_img_b*Psi
+
+        # combine images and backtransform
+        out[:,:,iCha] = fourier.fft((coil_img_a + coil_img_b_corr), axes=(0,1))/2
+
+    return out
+
+def calc_phase_align_matrix(a, b, threshold = 0.0015, radius = 0.25):
+    """Calculate PSI to align the phase of a and b such that no signal cancellation happens.
+
+    Args:
+        a (array): k-space data to be corrected
+        b (array): phase-correction reference data
+        threshold (float): threshold for masking of phase correlation matrix
+        radius (float): frequency limit from k-space center to be used in estimation of Psi
+
+    Output:
+        Psi: noise free correlation matrix
+
+    Author:
+        Julius Glaser <julius-glaser@gmx.de>
+
+    Reference:
+        Hoge
+        A subspace identification extension to the phase correlation method
+        DOI: 10.1109/TMI.2002.808359
+        Code: https://sigprocexperts.com/demo_code/sie_pcm/
+    """
+
+    assert len(a.shape) == 2, 'A should have a dimensionality of 2'
+    assert len(b.shape) == 2, 'B should have a dimensionality of 2'
+    assert radius < 0.5, f"radius can't be larger than 0.5, radius = {radius} "
+
+    m,n = a.shape
+
+    # calculate original phase correlation matrix (PCM)
+    Q = (a * np.conj(b))/ abs(a * np.conj(a) + 1e-10)
+
+    mask = np.ones_like(Q)
+    #TODO: fix mask
+    t = np.max(abs(a))*threshold
+
+    mask[ abs(a) > t ] = 1
+    # mask = medfilt2d(mask, 10 );       # 2D median filter of mask
+
+    U, S, VH = np.linalg.svd(Q*mask, full_matrices=False)
+
+    # noise free PCM has rank one so only first components are relevant
+    U = U[:,0]
+    V = VH.T.conj()
+    V = V[:,0]
+    
+    n2 = len(V)
+
+    # take centralized window of vector
+    t_n = np.arange(np.ceil((0.5-radius)*n2)-1, np.floor((0.5+radius)*n2)).astype(int) 
+    
+    unwrapped_angle_v = np.unwrap(np.angle(V[t_n]))
+    A = np.column_stack(((t_n).T, np.ones_like(t_n.T)))
+
+    # Perform linear least squares fit
+    sys_y, _, _, _ = np.linalg.lstsq(A, unwrapped_angle_v, rcond=None)
+
+    # mu is the slope of the fitted line
+    mu_1 = sys_y[0]
+
+    # equals mag of vertical shift of b to a
+    y = mu_1
+
+    m2 = len(U)
+    t_m = np.arange(np.ceil((0.5-radius)*m2)-1, np.floor((0.5+radius)*m2)).astype(int) # take centralized window of vector
+    
+    unwrapped_angle_u = np.unwrap(np.angle(U[t_m]))
+    A = np.column_stack(((t_m).T, np.ones_like(t_m.T)))
+
+    # Perform linear least squares fit
+    sys_x, _, _, _ = np.linalg.lstsq(A, unwrapped_angle_u, rcond=None)
+
+    # mu is the slope of the fitted line
+    mu_2 = sys_x[0]
+
+    # equals mag of horizontal shift of b to a
+    x = mu_2
+
+    # calculate Psi using slopes of hor and ver shift over complete length and hight
+    Psi = np.exp( 1j* x * np.arange(m).reshape(-1, 1) ) * np.exp( -1j* y * np.arange(n).reshape(-1, 1).T )
+    mc = m//2-1
+    nc = n//2-1
+
+    # This rotates Psi in the complex plane to align its phase with Q at the center pixel
+    Psi = Psi * np.exp(np.angle(np.conj(Psi[mc,nc])*Q[mc,nc])*1j)
+
+    return Psi
 
 def get_B(b, g):
     """Compute B matrix from b values and g vectors
