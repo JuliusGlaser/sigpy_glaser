@@ -8,11 +8,13 @@ Author:
 """
 import numpy as np
 from sigpy import fourier, util, block
+import sigpy as sp
+from sigpy.mri import sms, app
 
 MIN_POSITIVE_SIGNAL = 0.0001
 
 
-def phase_corr(kdat, pcor, topup_dim=-11):
+def phase_corr(kdat, pcor, topup_dim=-11, splitted=False):
     """perform phase correction.
 
     Args:
@@ -57,7 +59,10 @@ def phase_corr(kdat, pcor, topup_dim=-11):
 
     pcor_fac = np.exp(1j * slope * x)
     kdat_img *= pcor_fac
-    kdat_img = kdat_img.sum(topup_dim, keepdims=True)
+    if splitted:
+        pass
+    else:
+        kdat_img = kdat_img.sum(topup_dim, keepdims=True)
     output = fourier.fft(kdat_img, axes=[-1])
 
     return output
@@ -282,6 +287,143 @@ def pos_neg_add(a, b, threshold = 0.0015, radius = 0.25):
 
     return out
 
+def calc_PEM(refs_zf_split, coil, calib_width, sp_device=-1):
+
+    device = sp.Device(sp_device)
+    xp = device.xp
+
+    Necho, Ncha, Nsli, Ny, Nx = refs_zf_split.shape
+    MB = 1
+
+    estimated_echo_images = np.zeros_like(refs_zf_split[:,0,...])
+
+    print('> device: ', device)
+
+
+
+    for s in range(Nsli):
+
+        slice_str = str(s).zfill(3)
+        print('> slice idx: ', slice_str)
+
+        # read in k-space data
+        echo_pos = refs_zf_split[0,:,s,...]
+        echo_pos = echo_pos[:,np.newaxis, ...]
+        echo_neg = refs_zf_split[1,:,s,...]
+        echo_neg = echo_neg[:,np.newaxis, ...]
+
+        # map from collapsed slice index to interleaved uncollapsed slice list
+        # slice_mb_idx = sms.get_uncollap_slice_idx(N_slices, MB, s)
+        slice_mb_idx = sms.map_acquire_to_ordered_slice_idx(s, Nsli, MB)
+        # slice_mb_idx = [46, 93]
+
+        print('>> slice_mb_idx: ', slice_mb_idx)
+
+        coil2 = coil[:, slice_mb_idx, :, :]
+
+        kdat_pos_echo = sp.to_device(echo_pos, device=device)
+        kdat_neg_echo = sp.to_device(echo_neg, device=device)
+        coil2 = sp.to_device(coil2, device=device)
+
+        with device:
+            img_shape = [1,1,coil2.shape[-2], coil2.shape[-1]]
+
+            S = sp.linop.Multiply(img_shape, coil2)
+            F = sp.linop.FFT(S.oshape, axes=[-2, -1])
+            
+            weights_pos = (sp.rss(kdat_pos_echo, axes=(0, ), keepdims=True) > 0).astype(echo_pos.dtype)
+            weights_neg = (sp.rss(kdat_neg_echo, axes=(0, ), keepdims=True) > 0).astype(echo_neg.dtype)
+            W_pos = sp.linop.Multiply(F.oshape, weights_pos)
+            W_neg = sp.linop.Multiply(F.oshape, weights_neg)
+
+            A_pos = W_pos * F * S
+            A_neg = W_neg * F * S
+
+            AHA_pos = lambda x: A_pos.N(x) + 0.01 * x
+            AHA_neg = lambda x: A_neg.N(x) + 0.01 * x
+            AHy_pos = A_pos.H(kdat_pos_echo)
+            AHy_neg = A_neg.H(kdat_neg_echo)
+
+            img_pos = xp.zeros(img_shape, dtype=kdat_pos_echo.dtype)
+            img_neg = xp.zeros(img_shape, dtype=kdat_pos_echo.dtype)
+            alg_method_pos = sp.alg.ConjugateGradient(AHA_pos, AHy_pos, img_pos, max_iter=30, verbose=False)
+            alg_method_neg = sp.alg.ConjugateGradient(AHA_neg, AHy_neg, img_neg, max_iter=30, verbose=False)
+
+            while (not alg_method_pos.done()) and (not alg_method_neg.done()):
+                if (not alg_method_pos.done()):
+                    alg_method_pos.update()
+                if (not alg_method_neg.done()):
+                    alg_method_neg.update()
+
+            estimated_echo_images[0,s,...] = img_pos
+            estimated_echo_images[1,s,...] = img_neg
+
+    pem_mps = np.zeros_like(estimated_echo_images)
+    for s in range(Nsli):
+        print('  ' + str(s).zfill(3))
+
+        c = app.EspiritCalib(sp.fft(estimated_echo_images[:, s, :, :],axes=(-2,-1)),
+                            calib_width = calib_width,
+                            crop=0.,
+                            device=device, show_pbar=False).run()
+        pem_mps[:,s,...] = sp.to_device(c)
+
+    PEM_filtered = pem_mps[0,...]*np.conj(pem_mps[1,...])
+    PEM_filtered = PEM_filtered/abs(PEM_filtered)
+
+    PEM_filtered = PEM_filtered[np.newaxis,...]
+    mps_reord = sms.reorder_slices_mb1(PEM_filtered, Nsli)
+    return mps_reord
+
+def SB_PEM_recon(kdat, coil, PEM, s, N_slices, sp_device = -1):  
+
+    MB = 1
+
+    kdat = np.squeeze(kdat)  # 5 dim
+    kdat = np.swapaxes(kdat, -2, -3)
+    Necho, Ndiff, Ncha, Ny, Nx = kdat.shape
+    kdat = np.concatenate((kdat[0,...], kdat[1,...]), axis = 1)  # create virtual channels for pos and neg echos
+
+    device = sp.Device(sp_device)
+
+    print('> device: ', device)
+
+    xp = device.xp
+
+    slice_mb_idx = sms.map_acquire_to_ordered_slice_idx(s, N_slices, MB)
+
+    coil2 = np.concatenate((coil[:, slice_mb_idx, :, :]/2, coil[:, slice_mb_idx, :, :]*np.exp(-1j*np.angle(PEM[:, slice_mb_idx, :, :]))/2), axis=0)
+
+    with device:
+        img_shape = [1,1,coil2.shape[-2], coil2.shape[-1]]
+
+        S = sp.linop.Multiply(img_shape, coil2)
+        F = sp.linop.FFT(S.oshape, axes=[-2, -1])
+
+        dwi_pi_comb = []
+        for d in range(Ndiff):
+
+            k = kdat[d,...]
+            weights = (sp.rss(k[...], axes=(0, ), keepdims=True) > 0).astype(kdat.dtype)
+            W = sp.linop.Multiply(F.oshape, weights)
+            k = k[:,np.newaxis,...]
+
+            A = W * F * S
+
+            AHA = lambda x: A.N(x) + 0.01 * x
+            AHy = A.H(k)
+
+            img = xp.zeros(img_shape, dtype=k.dtype)
+            alg_method = sp.alg.ConjugateGradient(AHA, AHy, img, max_iter=30, verbose=False)
+
+            while (not alg_method.done()):
+                alg_method.update()
+
+            dwi_pi_comb.append(sp.to_device(img))
+
+        dwi_pi_comb = np.array(dwi_pi_comb)
+        return dwi_pi_comb
+    
 def calc_phase_align_matrix(a, b, threshold = 0.0015, radius = 0.25):
     """Calculate PSI to align the phase of a and b such that no signal cancellation happens.
 
@@ -391,7 +533,6 @@ def get_B(b, g):
 
     return - b * np.array([gx**2, 2*gx*gy, gy**2,
                            2*gx*gz, 2*gy*gz, gz**2]).transpose()
-
 
 def get_B2(b, g):
     """For Diffusion Kurtosis:
