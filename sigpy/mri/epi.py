@@ -10,6 +10,7 @@ import numpy as np
 from sigpy import fourier, util, block
 import sigpy as sp
 from sigpy.mri import sms, app
+import h5py
 
 MIN_POSITIVE_SIGNAL = 0.0001
 
@@ -69,7 +70,8 @@ def phase_corr(kdat, pcor, topup_dim=-11, splitted=False):
 
 def SAKE_ref_correction(kdat_ref, calib_shape, 
                         kSize=[3,3], 
-                        threshold_SAKE=4, 
+                        SAKE_beta_rel=0.001,#600000
+                        SAKE_p = 0.5, 
                         nIter=30, 
                         threshold_PSI_calc = 0.0015, 
                         radius_PSI_calc = 0.25):
@@ -79,7 +81,8 @@ def SAKE_ref_correction(kdat_ref, calib_shape,
         kdat_ref (array): k-space data of the already simply corrected references
         calib_shape (list or int): shape of the calibration area
         kSize (list): shape of the SAKE kernel
-        threshold_SAKE (int): number of singular values to keep in SAKE
+        SAKE_beta_rel (float):  TODO
+        SAKE_p (float):        TODO
         nIter (int): number of iterations to run SAKE
         threshold_PSI_calc (float): threshold for masking of phase correlation matrix in Psi calculation in phase alignment
         radius_PSI_calc (float): frequency limit from k-space center to be used in estimation of Psi in phase alignment
@@ -138,7 +141,7 @@ def SAKE_ref_correction(kdat_ref, calib_shape,
         mask[:,0::2,:] += 1
 
 
-        res = SAKEwithInitialValue(calib_vc, mask, kSize, threshold_SAKE, nIter)
+        res = SAKEwithInitialValue(calib_vc, mask, kSize, SAKE_beta_rel, SAKE_p, nIter)
 
         # reverse shifting from before
         res[:,:, Ncha:] = np.roll(res[:,:, Ncha:], shift=1, axis=-2)
@@ -153,7 +156,7 @@ def SAKE_ref_correction(kdat_ref, calib_shape,
 
     return calib_SAKE_zf 
 
-def SAKEwithInitialValue(DATA, mask, kSize, wnRank, nIter):
+def SAKEwithInitialValue(DATA, mask, kSize, beta_relative=0.01, p=0.01, nIter=50):
     """perform SAKE for already initial corrected EPI data split in negative and positvie echos.
        This is effectively the python implementation of the matlab function SAKEwithInitialValue by Lyu
 
@@ -161,7 +164,8 @@ def SAKEwithInitialValue(DATA, mask, kSize, wnRank, nIter):
         DATA (array): k-space data of the calibration area with pos and neg echos as virtual channels
         mask (array): mask of pos and neg echos (same mask for both as neg are shifted before)
         kSize (list): shape of the SAKE kernel
-        wnRank (int): number of singular values to keep in SAKE
+        beta (float): TODO
+        p (float): TODO
         nIter (int): number of iterations to run SAKE
 
     Output:
@@ -197,12 +201,20 @@ def SAKEwithInitialValue(DATA, mask, kSize, wnRank, nIter):
         tsx, tsy, tsz = tmp.shape
         A = np.reshape(tmp, (tsx, tsy*tsz), order='F')
 
-        # Perform SVD on calibration matrix and keep up to wnRank the singular values
+        # Perform SVD on calibration matrix and keep up to number specified by Schatten norm
         U, S, VH = np.linalg.svd(A, full_matrices=False)
-        keep = np.arange(0, int(np.floor(wnRank * np.prod(kSize))))  # 0-based indexing
-        S_keep = np.diag(S[keep])
-
-        A = U[:, keep] @ S_keep @ VH[keep, :]
+        beta = S[0]*beta_relative
+        S_new = S-S**(p-1)*beta         # times beta, because S[0] is really small, therefore beta_relative would need to be extremely large if divided by
+        # print(S[0])
+        # print(S[0]**(p-1)/beta)
+        S_new = S_new[S_new>0]
+        rank_new = len(S_new)
+        S_keep = np.diag(S_new)
+        
+        print(rank_new)
+        if rank_new < 15:
+            raise ValueError(f"Rank must be greater than 15, was {rank_new}")
+        A = U[:,0:rank_new] @ S_keep @ VH[0:rank_new, :]
 
         # Enforce Hankel structure
         A = np.reshape(A,(tsx,tsy,tsz), order='F')
@@ -306,17 +318,18 @@ def calc_PEM(refs_zf_split, coil, calib_width, sp_device=-1):
         slice_str = str(s).zfill(3)
         print('> slice idx: ', slice_str)
 
-        # read in k-space data
-        echo_pos = refs_zf_split[0,:,s,...]
-        echo_pos = echo_pos[:,np.newaxis, ...]
-        echo_neg = refs_zf_split[1,:,s,...]
-        echo_neg = echo_neg[:,np.newaxis, ...]
-
         # map from collapsed slice index to interleaved uncollapsed slice list
         # slice_mb_idx = sms.get_uncollap_slice_idx(N_slices, MB, s)
         slice_mb_idx = sms.map_acquire_to_ordered_slice_idx(s, Nsli, MB)
         # slice_mb_idx = [46, 93]
 
+
+        # read in k-space data
+        echo_pos = refs_zf_split[0,:,slice_mb_idx,...].squeeze()
+        
+        echo_pos = echo_pos[:,np.newaxis, ...]
+        echo_neg = refs_zf_split[1,:,slice_mb_idx,...].squeeze()
+        echo_neg = echo_neg[:,np.newaxis, ...]
         print('>> slice_mb_idx: ', slice_mb_idx)
 
         coil2 = coil[:, slice_mb_idx, :, :]
@@ -355,25 +368,28 @@ def calc_PEM(refs_zf_split, coil, calib_width, sp_device=-1):
                 if (not alg_method_neg.done()):
                     alg_method_neg.update()
 
-            estimated_echo_images[0,s,...] = img_pos
-            estimated_echo_images[1,s,...] = img_neg
+            estimated_echo_images[0,slice_mb_idx,...] = img_pos
+            estimated_echo_images[1,slice_mb_idx,...] = img_neg
 
-    pem_mps = np.zeros_like(estimated_echo_images)
-    for s in range(Nsli):
-        print('  ' + str(s).zfill(3))
+    f = h5py.File('estimated_echos.h5', 'w')
+    f.create_dataset('estimated_echos', data=estimated_echo_images)
+    f.close()
+    # pem_mps = np.zeros_like(estimated_echo_images)
+    # for s in range(Nsli):
+    #     print('  ' + str(s).zfill(3))
 
-        c = app.EspiritCalib(sp.fft(estimated_echo_images[:, s, :, :],axes=(-2,-1)),
-                            calib_width = calib_width,
-                            crop=0.,
-                            device=device, show_pbar=False).run()
-        pem_mps[:,s,...] = sp.to_device(c)
+    #     c = app.EspiritCalib(sp.fft(estimated_echo_images[:, s, :, :],axes=(-2,-1)),
+    #                         calib_width = calib_width,
+    #                         crop=0.,
+    #                         device=device, show_pbar=False).run()
+    #     pem_mps[:,s,...] = sp.to_device(c)
 
-    PEM_filtered = pem_mps[0,...]*np.conj(pem_mps[1,...])
-    PEM_filtered = PEM_filtered/abs(PEM_filtered)
+    PEM_filtered = estimated_echo_images[0,...]*np.conj(estimated_echo_images[1,...])
+    # PEM_filtered = PEM_filtered/abs(PEM_filtered)
 
     PEM_filtered = PEM_filtered[np.newaxis,...]
-    mps_reord = sms.reorder_slices_mb1(PEM_filtered, Nsli)
-    return mps_reord
+    # mps_reord = sms.reorder_slices_mb1(PEM_filtered, Nsli)
+    return PEM_filtered
 
 def SB_PEM_recon(kdat, coil, PEM, s, N_slices, sp_device = -1):  
 
@@ -382,7 +398,7 @@ def SB_PEM_recon(kdat, coil, PEM, s, N_slices, sp_device = -1):
     kdat = np.squeeze(kdat)  # 5 dim
     kdat = np.swapaxes(kdat, -2, -3)
     Necho, Ndiff, Ncha, Ny, Nx = kdat.shape
-    kdat = np.concatenate((kdat[0,...], kdat[1,...]), axis = 1)  # create virtual channels for pos and neg echos
+    kdat = kdat[0,...] + kdat[1,...] # 4dim
 
     device = sp.Device(sp_device)
 
@@ -392,29 +408,96 @@ def SB_PEM_recon(kdat, coil, PEM, s, N_slices, sp_device = -1):
 
     slice_mb_idx = sms.map_acquire_to_ordered_slice_idx(s, N_slices, MB)
 
-    coil2 = np.concatenate((coil[:, slice_mb_idx, :, :]/2, coil[:, slice_mb_idx, :, :]*np.exp(-1j*np.angle(PEM[:, slice_mb_idx, :, :]))/2), axis=0)
+    coil2 = np.stack((coil[:, slice_mb_idx, :, :]*np.exp(1j*np.angle(PEM[:,slice_mb_idx,...]))/2, coil[:, slice_mb_idx, :, :]/2), axis=0)
 
     with device:
-        img_shape = [1,1,coil2.shape[-2], coil2.shape[-1]]
+        img_shape = [1,1,1,coil2.shape[-2], coil2.shape[-1]]
 
         S = sp.linop.Multiply(img_shape, coil2)
         F = sp.linop.FFT(S.oshape, axes=[-2, -1])
+        D = sp.linop.Sum(F.oshape, axes=(0, ), keepdims=False)
+        print(img_shape)
+        print(S.oshape)
+        print(F.oshape)
+        print(D.oshape)
 
         dwi_pi_comb = []
         for d in range(Ndiff):
 
             k = kdat[d,...]
             weights = (sp.rss(k[...], axes=(0, ), keepdims=True) > 0).astype(kdat.dtype)
-            W = sp.linop.Multiply(F.oshape, weights)
+            W = sp.linop.Multiply(D.oshape, weights)
             k = k[:,np.newaxis,...]
-
-            A = W * F * S
+            print(W.oshape)
+            print(k.shape)
+            A = W * D * F * S
 
             AHA = lambda x: A.N(x) + 0.01 * x
             AHy = A.H(k)
 
             img = xp.zeros(img_shape, dtype=k.dtype)
             alg_method = sp.alg.ConjugateGradient(AHA, AHy, img, max_iter=30, verbose=False)
+
+            while (not alg_method.done()):
+                alg_method.update()
+
+            dwi_pi_comb.append(sp.to_device(img))
+
+        dwi_pi_comb = np.array(dwi_pi_comb)
+        return dwi_pi_comb
+    
+def MB_PEM_recon(kdat, coil, PEM, s, N_slices, MB, pat, sp_device = -1):  
+
+    
+
+    kdat = np.squeeze(kdat)  # 5 dim
+    kdat = np.swapaxes(kdat, -2, -3)
+    Necho, Ndiff, Ncha, Ny, Nx = kdat.shape
+    kdat = np.concatenate((kdat[0,...], kdat[1,...]), axis = 1)  # create virtual channels for pos and neg echos
+
+    # number of collapsed slices
+    N_slices_collap = N_slices // MB
+
+    # SMS phase shift
+    yshift = []
+    for b in range(MB):
+        yshift.append(b / pat)
+
+    sms_phase = sms.get_sms_phase_shift([MB, Ny, Nx], MB=MB, yshift=yshift)
+
+    device = sp.Device(sp_device)
+
+    print('> device: ', device)
+
+    xp = device.xp
+
+    slice_mb_idx = sms.map_acquire_to_ordered_slice_idx(s, N_slices, MB)
+
+    coil2 = np.concatenate((coil[:, slice_mb_idx, :, :]/2, coil[:, slice_mb_idx, :, :]/2), axis=0)
+
+    with device:
+        img_shape = [1,MB,coil2.shape[-2], coil2.shape[-1]]
+
+        S = sp.linop.Multiply(img_shape, coil2)
+        F = sp.linop.FFT(S.oshape, axes=[-2, -1])
+        P = sp.linop.Multiply(F.oshape, sms_phase)
+        M = sp.linop.Sum(P.oshape, axes=(-3, ), keepdims=True)
+
+        dwi_pi_comb = []
+        for d in range(Ndiff):
+
+            k = kdat[d,...]
+            weights = (sp.rss(k[...], axes=(0, ), keepdims=True) > 0).astype(kdat.dtype)
+            W = sp.linop.Multiply(M.oshape, weights)
+            k = k[:,np.newaxis,...]
+
+            A = W * M * P * F * S
+
+            AHA = lambda x: A.N(x) + 0.01 * x
+            AHy = A.H(k)
+
+            img = xp.zeros(img_shape, dtype=k.dtype)
+            alg_method = sp.alg.ConjugateGradient(AHA, AHy, img, max_iter=100, verbose=False)
 
             while (not alg_method.done()):
                 alg_method.update()
