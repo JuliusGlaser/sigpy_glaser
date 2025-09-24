@@ -757,7 +757,7 @@ class HighDimensionalRecon(sp.app.LinearLeastSquares):
                  use_dcf=False,
                  basis=None,
                  phase_echo=None, combine_echo=True,
-                 phase_sms=None,
+                 phase_sms=None, coil_batch_size=None,
                  scale=0, regu='TIK', regu_kspace=False,
                  regu_axes=[-2, -1], x=None,
                  blk_shape=(8, 8), blk_strides=(8, 8),
@@ -765,7 +765,7 @@ class HighDimensionalRecon(sp.app.LinearLeastSquares):
                  deep_model=None,
                  thresh='soft', max_iter=50,
                  ro_extend_fold=1, solver=None,
-                 device=sp.cpu_device, show_pbar=True,
+                 device=sp.Device(0), show_pbar=True,
                  **kwargs):
 
         # k-space data in accordance with sigpy/mri/dims.py
@@ -782,94 +782,188 @@ class HighDimensionalRecon(sp.app.LinearLeastSquares):
         # start to construct image shape
         img_shape = [1] + [MB] + [Ny] + [Nx]
 
+        if coil_batch_size is None:
+            coil_batch_size = Ncoil
+        
         # %% construct MRI forward model
+        if coil_batch_size < mps.shape[0]:
+            num_coil_batches = (Ncoil + coil_batch_size - 1) // coil_batch_size
+            A_list = []
+            for c in range(num_coil_batches):
+                if basis is not None:
 
-        #### case 1. subspace modeling
-        if basis is not None:
+                    Ncontrast, Ncoef = basis.shape
+                    assert(Ncontrast == Ntime * Necho)
 
-            Ncontrast, Ncoef = basis.shape
-            assert(Ncontrast == Ntime * Necho)
+                    ishape = [Ncoef] + [1] + img_shape
 
-            ishape = [Ncoef] + [1] + img_shape
+                    sub_ishape = [Ncoef] + [np.prod(ishape[1:])]
+                    sub_oshape = [Ntime] + [Necho] + img_shape
 
-            sub_ishape = [Ncoef] + [np.prod(ishape[1:])]
-            sub_oshape = [Ntime] + [Necho] + img_shape
+                    B1 = sp.linop.Reshape(sub_ishape, ishape)
+                    B2 = sp.linop.MatMul(B1.oshape, basis)
+                    B3 = sp.linop.Reshape(sub_oshape, B2.oshape)
 
-            B1 = sp.linop.Reshape(sub_ishape, ishape)
-            B2 = sp.linop.MatMul(B1.oshape, basis)
-            B3 = sp.linop.Reshape(sub_oshape, B2.oshape)
+                    B = B3 * B2 * B1
 
-            B = B3 * B2 * B1
+                else:
 
+                    if combine_echo is True:
+
+                        assert(phase_echo is not None)
+                        ishape = [Ntime] + [1] + img_shape
+
+                    else:
+
+                        ishape = [Ntime] + [Necho] + img_shape
+
+                    B = sp.linop.Identity(ishape)
+
+
+                #### case 2. echo phase modeling
+                if phase_echo is not None:
+
+                    self._check_two_shape([Ntime] + [Necho] + img_shape, phase_echo.shape)
+
+                    P = sp.linop.Multiply(B.oshape, phase_echo)
+
+                else:
+
+                    P = sp.linop.Identity(B.oshape)
+
+
+                #### parallel imaging modeling
+
+                # only one set of coil sensitivity maps for all images
+                assert(y.shape[DIM_COIL] == mps.shape[DIM_COIL])
+
+                S = sp.linop.Multiply(P.oshape, mps[c * coil_batch_size : ((c + 1) * coil_batch_size),...])
+
+
+                # FFT
+                if coord is None:
+                    self._check_two_shape(list(y.shape[DIM_Y:]), mps.shape[DIM_Y:])
+                    F = sp.linop.FFT(S.oshape, axes=range(-2, 0))
+
+                else:
+                    F = sp.linop.HDNUFFT(S.oshape, coord, use_dcf=use_dcf)
+
+
+                # SMS
+                if phase_sms is not None:
+
+                    self._check_two_shape(list(phase_sms.shape), mps.shape[DIM_Z:])
+
+                    PHI = sp.linop.Multiply(F.oshape, phase_sms)
+                    SUM = sp.linop.Sum(PHI.oshape, axes=(DIM_Z, ), keepdims=True)
+
+                    M = SUM * PHI
+
+                else:
+
+                    M = sp.linop.Identity(F.oshape)
+
+
+                # compute k-space sampling mask
+                if weights is None:
+                    weights = _estimate_weights(y, weights, coord, coil_dim=DIM_COIL)
+                y = sp.to_device(y)
+                y = sp.to_device(y * weights**0.5, device=device)
+
+                W = sp.linop.Multiply(M.oshape, weights**0.5)
+
+
+                #### chain models
+                A = W * M * F * S * P * B
+                A_list.append(A)
+                A = sp.linop.Vstack(A_list, axis=2)
         else:
+            #### case 1. subspace modeling
+            if basis is not None:
 
-            if combine_echo is True:
+                Ncontrast, Ncoef = basis.shape
+                assert(Ncontrast == Ntime * Necho)
 
-                assert(phase_echo is not None)
-                ishape = [Ntime] + [1] + img_shape
+                ishape = [Ncoef] + [1] + img_shape
+
+                sub_ishape = [Ncoef] + [np.prod(ishape[1:])]
+                sub_oshape = [Ntime] + [Necho] + img_shape
+
+                B1 = sp.linop.Reshape(sub_ishape, ishape)
+                B2 = sp.linop.MatMul(B1.oshape, basis)
+                B3 = sp.linop.Reshape(sub_oshape, B2.oshape)
+
+                B = B3 * B2 * B1
 
             else:
 
-                ishape = [Ntime] + [Necho] + img_shape
+                if combine_echo is True:
 
-            B = sp.linop.Identity(ishape)
+                    assert(phase_echo is not None)
+                    ishape = [Ntime] + [1] + img_shape
 
+                else:
 
-        #### case 2. echo phase modeling
-        if phase_echo is not None:
+                    ishape = [Ntime] + [Necho] + img_shape
 
-            self._check_two_shape([Ntime] + [Necho] + img_shape, phase_echo.shape)
-
-            P = sp.linop.Multiply(B.oshape, phase_echo)
-
-        else:
-
-            P = sp.linop.Identity(B.oshape)
+                B = sp.linop.Identity(ishape)
 
 
-        #### parallel imaging modeling
+            #### case 2. echo phase modeling
+            if phase_echo is not None:
 
-        # only one set of coil sensitivity maps for all images
-        assert(y.shape[DIM_COIL] == mps.shape[DIM_COIL])
+                self._check_two_shape([Ntime] + [Necho] + img_shape, phase_echo.shape)
 
-        S = sp.linop.Multiply(P.oshape, mps)
+                P = sp.linop.Multiply(B.oshape, phase_echo)
 
+            else:
 
-        # FFT
-        if coord is None:
-            self._check_two_shape(list(y.shape[DIM_Y:]), mps.shape[DIM_Y:])
-            F = sp.linop.FFT(S.oshape, axes=range(-2, 0))
-
-        else:
-            F = sp.linop.HDNUFFT(S.oshape, coord, use_dcf=use_dcf)
+                P = sp.linop.Identity(B.oshape)
 
 
-        # SMS
-        if phase_sms is not None:
+            #### parallel imaging modeling
 
-            self._check_two_shape(list(phase_sms.shape), mps.shape[DIM_Z:])
+            # only one set of coil sensitivity maps for all images
+            assert(y.shape[DIM_COIL] == mps.shape[DIM_COIL])
 
-            PHI = sp.linop.Multiply(F.oshape, phase_sms)
-            SUM = sp.linop.Sum(PHI.oshape, axes=(DIM_Z, ), keepdims=True)
-
-            M = SUM * PHI
-
-        else:
-
-            M = sp.linop.Identity(F.oshape)
+            S = sp.linop.Multiply(P.oshape, mps)
 
 
-        # compute k-space sampling mask
-        if weights is None:
-            weights = _estimate_weights(y, weights, coord, coil_dim=DIM_COIL)
+            # FFT
+            if coord is None:
+                self._check_two_shape(list(y.shape[DIM_Y:]), mps.shape[DIM_Y:])
+                F = sp.linop.FFT(S.oshape, axes=range(-2, 0))
 
-        y = sp.to_device(y * weights**0.5, device=device)
+            else:
+                F = sp.linop.HDNUFFT(S.oshape, coord, use_dcf=use_dcf)
 
-        W = sp.linop.Multiply(M.oshape, weights**0.5)
+
+            # SMS
+            if phase_sms is not None:
+
+                self._check_two_shape(list(phase_sms.shape), mps.shape[DIM_Z:])
+
+                PHI = sp.linop.Multiply(F.oshape, phase_sms)
+                SUM = sp.linop.Sum(PHI.oshape, axes=(DIM_Z, ), keepdims=True)
+
+                M = SUM * PHI
+
+            else:
+
+                M = sp.linop.Identity(F.oshape)
 
 
-        #### chain models
-        A = W * M * F * S * P * B
+            # compute k-space sampling mask
+            if weights is None:
+                weights = _estimate_weights(y, weights, coord, coil_dim=DIM_COIL)
+
+            y = sp.to_device(y * weights**0.5, device=device)
+
+            W = sp.linop.Multiply(M.oshape, weights**0.5)
+
+
+            #### chain models
+            A = W * M * F * S * P * B
 
 
         # %% scale y

@@ -11,6 +11,7 @@ from sigpy import fourier, util, block
 import sigpy as sp
 from sigpy.mri import sms, app
 import h5py
+from copy import deepcopy
 
 MIN_POSITIVE_SIGNAL = 0.0001
 
@@ -69,9 +70,10 @@ def phase_corr(kdat, pcor, topup_dim=-11, splitted=False):
     return output
 
 def SAKE_ref_correction(kdat_ref, calib_shape, 
+                        iPat,
                         kSize=[3,3], 
                         SAKE_beta_rel=0.001,#600000
-                        SAKE_p = 0.5, 
+                        SAKE_p = 0.1, 
                         nIter=30, 
                         threshold_PSI_calc = 0.0015, 
                         radius_PSI_calc = 0.25):
@@ -121,6 +123,9 @@ def SAKE_ref_correction(kdat_ref, calib_shape,
         raise TypeError("calib_width must be either a 2 entry list or an integer")
 
     calib_SAKE = []
+    combined_save = []
+    pre_comp_save = []
+    res_save = []
     # run SAKE seperatly for each slice
     for i in range(Nsli):
         print('>> slice number ', i)
@@ -132,29 +137,59 @@ def SAKE_ref_correction(kdat_ref, calib_shape,
         # resize data to get only calib region in the center
         calib = util.resize(data, n_calib_shape)
 
+        as2shot = False
         # join calib region twice as virtual channels and shift the higher channels to 
         # use the same mask for positive and negative echos
-        calib_vc = np.concatenate((calib, np.roll(calib, shift=-1, axis=-2)), axis=-1)
+        if iPat == 2:
+            calib_vc = np.concatenate((calib, np.roll(calib, shift=-1, axis=-2)), axis=-1)
+        else:
+            calib_vc = np.zeros((n_calib_shape[0], n_calib_shape[1], Ncha*iPat*2), dtype=kdat_ref.dtype)
+            print(calib_vc.shape)
+            if as2shot:
+                pass
+            else:
+                for i in range(iPat):
+                    calib_vc[:,:, i*Ncha:(i+1)*Ncha] = (np.roll(calib, shift=-i, axis=-2))
+                    calib_vc[:,:, (iPat+i)*Ncha:(iPat+i+1)*Ncha] = (np.roll(calib, shift=-iPat-i, axis=-2))
+        print(calib_vc.shape)
 
         # mask for positive and negative echos is the same due to shifting before
         mask = np.zeros_like(calib_vc)
         mask[:,0::2,:] += 1
-
+        pre_comp_save.append(calib_vc)
 
         res = SAKEwithInitialValue(calib_vc, mask, kSize, SAKE_beta_rel, SAKE_p, nIter)
 
         # reverse shifting from before
-        res[:,:, Ncha:] = np.roll(res[:,:, Ncha:], shift=1, axis=-2)
+        if iPat == 2:
+            res[:,:, Ncha:] = np.roll(res[:,:, Ncha:], shift=1, axis=-2)
+        else:
+            if as2shot:
+                pass
+            else:
+                for i in range(iPat):
+                    res[:,:,(i) *Ncha:(i+1)*Ncha]           =   np.roll(res[:,:, (i) *Ncha:(i+1)*Ncha], shift=i, axis=-2)          #pos echos
+                    res[:,:,(i+iPat) *Ncha:(i+iPat+1)*Ncha] =   np.roll(res[:,:, (i+iPat) *Ncha:(i+iPat+1)*Ncha], shift=iPat+i, axis=-2)    #neg echos
+        res_save.append(deepcopy(res))
 
         # add positive and negative estimated echos together without signal cancellation
-        calib_SAKE.append(pos_neg_add(res[:,:, 0:Ncha], res[:,:, Ncha:], threshold_PSI_calc, radius_PSI_calc))
+        if iPat == 2 or as2shot:
+            calib_SAKE.append(pos_neg_add(res[:,:, 0:Ncha], res[:,:, Ncha:], threshold_PSI_calc, radius_PSI_calc))
+        else:
+            combined = []
+            for i in range(iPat):
+                combined.append(pos_neg_add(res[:,:, (i*2) *Ncha:(i*2+1)*Ncha], res[:,:,(i*2+1) *Ncha:(i*2+2)*Ncha], threshold_PSI_calc, radius_PSI_calc))
+            combined_save.append(deepcopy(combined))
+            while len(combined) > 1:
+                combined.append(pos_neg_add(combined.pop(0), combined.pop(0), threshold_PSI_calc, radius_PSI_calc))
+            calib_SAKE.append(combined.pop(0))
 
     # bring calculated references in shape Ncha, Nsli, Ny, Nx and zero fill
     calib_SAKE = np.array(calib_SAKE)
     calib_SAKE = np.transpose(calib_SAKE, (-1, 0, 2, 1))
     calib_SAKE_zf = util.resize(calib_SAKE, [Ncha, Nsli, Ny, Nx])
 
-    return calib_SAKE_zf 
+    return calib_SAKE_zf, res_save, combined_save, pre_comp_save
 
 def SAKEwithInitialValue(DATA, mask, kSize, beta_relative=0.01, p=0.01, nIter=50):
     """perform SAKE for already initial corrected EPI data split in negative and positvie echos.
@@ -212,8 +247,8 @@ def SAKEwithInitialValue(DATA, mask, kSize, beta_relative=0.01, p=0.01, nIter=50
         S_keep = np.diag(S_new)
         
         print(rank_new)
-        if rank_new < 15:
-            raise ValueError(f"Rank must be greater than 15, was {rank_new}")
+        # if rank_new < 15:
+        #     raise ValueError(f"Rank must be greater than 15, was {rank_new}")
         A = U[:,0:rank_new] @ S_keep @ VH[0:rank_new, :]
 
         # Enforce Hankel structure
