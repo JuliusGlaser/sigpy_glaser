@@ -765,7 +765,7 @@ class HighDimensionalRecon(sp.app.LinearLeastSquares):
                  deep_model=None,
                  thresh='soft', max_iter=50,
                  ro_extend_fold=1, solver=None,
-                 device=sp.Device(0), show_pbar=True,
+                 device=sp.Device(-1), show_pbar=True,
                  **kwargs):
 
         # k-space data in accordance with sigpy/mri/dims.py
