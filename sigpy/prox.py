@@ -599,15 +599,19 @@ class DAEReg(Prox):
 
         input_pt = torch.from_numpy(backend.to_device(input)).to(device)
 
-        mag = torch.abs(input_pt)
-        phs = torch.angle(input_pt)
+        baseline = input[0]
+
+        dwi_scale = torch.where(baseline!=0, torch.true_divide(input, baseline), torch.zeros_like(input))
+
+        mag = torch.abs(dwi_scale)
+        phs = torch.angle(dwi_scale)
 
         mag_r = mag.view(N_diff, -1).t()  # [-1, N_diff]
 
         reg_m = self.DAE(mag_r)
         reg_m = reg_m.t().view(self.shape)
 
-        output = reg_m * torch.exp(1j * phs)
+        output = reg_m  * baseline * torch.exp(1j * phs)
         output = output.detach().cpu().numpy()
 
         return backend.to_device(output, device=sp_device)
