@@ -123,6 +123,35 @@ def get_ordered_slice_idx(acq_slice_idx, N_slices):
         return ordered_slice_idx[acq_slice_idx]
     else:
         return [ordered_slice_idx[i] for i in list(acq_slice_idx)]
+    
+def get_corresponding_ref_slice_idx(N_slices_uncollap, MB, collap_slice_idx):
+    """
+    Get the ordered (geometrically correct) slice indices of MB=1 reference dataset according to a specific MB slice
+    from the acquisition slice order.
+
+    Args:
+        N_slices_uncollap (int): total number of uncollapsed slices.
+        MB (int): multi-band factor.
+        collap_slice_idx (int): collapsed slice index.
+
+    e.g.:
+        slice_idx = get_uncollap_slice_idx(50, 2, 0)
+        corresponds to k-space slices [0, 12] and returns the according ref slice indices
+        returns [25, 31]
+    """
+    indices = get_uncollap_slice_idx(N_slices_uncollap=N_slices_uncollap, MB=MB, collap_slice_idx=collap_slice_idx)
+    ref_indices = []
+    N_slices_uncollap_half = N_slices_uncollap // 2
+    for ind in indices:
+        if ind % 2 == 0:
+            # even index -> second half
+            
+            ref_indices.append(ind//2 + N_slices_uncollap_half)
+        else:
+            # odd index -> first half
+            ref_indices.append(ind//2)
+
+    return ref_indices
 
 
 def reorder_slices_mb1(input, N_slices, slice_axis=-3):
