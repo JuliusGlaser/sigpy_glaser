@@ -139,7 +139,7 @@ def get_corresponding_ref_slice_idx(N_slices_uncollap, MB, collap_slice_idx):
         corresponds to k-space slices [0, 12] and returns the according ref slice indices
         returns [25, 31]
     """
-    indices = get_uncollap_slice_idx(N_slices_uncollap=N_slices_uncollap, MB=MB, collap_slice_idx=collap_slice_idx)
+    indices = map_acquire_to_ordered_slice_idx(collap_slice_idx, N_slices_uncollap, MB)
     ref_indices = []
     N_slices_uncollap_half = N_slices_uncollap // 2
     for ind in indices:
