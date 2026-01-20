@@ -16,7 +16,7 @@ from copy import deepcopy
 MIN_POSITIVE_SIGNAL = 0.0001
 
 
-def phase_corr(kdat, pcor, topup_dim=-11, splitted=False):
+def phase_corr(kdat, pcor, topup_dim=-11, splitted=False, across_seg=False):
     """perform phase correction.
 
     Args:
@@ -54,12 +54,22 @@ def phase_corr(kdat, pcor, topup_dim=-11, splitted=False):
 
     pcor_img = fourier.ifft(pcor, axes=[col_dim])
     kdat_img = fourier.ifft(kdat, axes=[col_dim])
-
-    slope = np.angle((np.conj(pcor_img[..., 1:]) * pcor_img[..., :-1])
-                     .sum(col_dim, keepdims=True).sum(-2, keepdims=True))
+    
     x = np.arange(ncol) - ncol//2
 
-    pcor_fac = np.exp(1j * slope * x)
+    if across_seg:
+        # calculate phase slope from cross-correlation between segments
+        diff = np.conj(pcor_img[:, :, :, :, :, 1:]) * pcor_img[:, :, :, :, :, :1]
+        # now calculate slope from autocorrelation of the difference
+        slope = np.angle((np.conj(diff[...,1:]) * diff[...,:-1]).sum(-1, keepdims=True).sum(-2, keepdims=True))
+        # apply half of the slope to each segment
+        pcor_fac = np.exp(1j * slope/2 * x)
+        pcor_fac = np.concatenate([pcor_fac, np.conj(pcor_fac)], axis=5)
+    else:
+        # calculate phase slope from autocorrelation (for both readout polarities separately - each in its own dim)
+        slope = np.angle((np.conj(pcor_img[...,1:]) * pcor_img[...,:-1]).sum(-1, keepdims=True).sum(-2, keepdims=True))
+        pcor_fac = np.exp(1j * slope * x)
+
     kdat_img *= pcor_fac
     if splitted:
         pass
