@@ -563,12 +563,13 @@ class Vstack(Linop):
 
     """
 
-    def __init__(self, linops, axis=None):
+    def __init__(self, linops, axis=None, bypass_device=False):
         self.nops = len(linops)
         _check_linops_same_ishape(linops)
 
         self.axis = axis
         self.linops = linops
+        self.bypass_device = bypass_device
 
         oshape, self.indices = _vstack_params(
             [linop.oshape for linop in self.linops], axis
@@ -579,6 +580,10 @@ class Vstack(Linop):
 
     def _apply(self, input):
         device = backend.get_device(input)
+        print("Vstack device: ", device)
+        if self.bypass_device:
+            device = backend.Device(-1)
+            print("Device in Vstack changed to: ", device)
         xp = device.xp
         with device:
             output = xp.empty(self.oshape, dtype=input.dtype)

@@ -392,11 +392,23 @@ class LLRL1Reg(Prox):
         self.verbose = verbose
 
         # construct forward linops
+        # Construct forward slice-wise
+        self.n_slice = shape[2]
+        self.n_slice_chunk = 10
+        shape = shape[0:2] + [self.n_slice_chunk] + shape[-2:]
+        
+        print("Shape: ", shape)
+        print("blk_shape", blk_shape)
+
         self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
         self.A = linop.ArrayToBlocks(shape, blk_shape, blk_strides)
         self.Reshape = self._linop_reshape()
 
         self.Fwd = self.Reshape * self.A * self.RandShift
+        print("Fwd inshape: ", self.Fwd.ishape)
+        print("Fwd out shape", self.Fwd.oshape)
+        print("A inshape: ", self.A.ishape)
+        print("A out shape", self.A.oshape)
 
         super().__init__(shape)
 
@@ -405,9 +417,11 @@ class LLRL1Reg(Prox):
 
     def _prox(self, alpha, input):
         device = backend.get_device(input)
+        print("Prox_device = ", device)
         xp = device.xp
 
         with device:
+            import time
 
             if self.reg_magnitude:
                 mag = xp.abs(input)
@@ -417,22 +431,59 @@ class LLRL1Reg(Prox):
                 mag = input.copy()
                 phs = xp.ones_like(mag)
 
-            output = self.Fwd(mag)
+            print("Mag shape: ", mag.shape)
+            processed_out = []
+            for n_slice in range(0,self.n_slice, self.n_slice_chunk):
 
-            u, s, vh = xp.linalg.svd(output, full_matrices=False)
+                print(f">> LLR on slice {n_slice} of {self.n_slice}")
 
-            if self.normalization is True:
-                s = s / self.blk_shape[-1]
+                output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,...])
+                print("SVD computation")
+                print(">>> shape of the array for SVD: ", output.shape)
+                
+                n_patches = output.shape[0]
+                # output_comb = xp.zeros_like(output)
+                steps = 10
 
-            s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
+                for i in range(steps):
+                    t = time.time()
 
-            if self.normalization is True:
-                s_thresh = s_thresh * self.blk_shape[-1]
+                    patch_start = i * (n_patches // steps)
 
-            output = (u * s_thresh[..., None, :]) @ vh
+                    if i == steps - 1:
+                        patch_end = n_patches        # last step gets remainder
+                    else:
+                        patch_end = (i + 1) * (n_patches // steps)
 
-            output = self.Fwd.H(output)
+                    output_part = output[patch_start:patch_end, ...]
+                    #apply LLR only on central slices
+                    if n_slice >= 90 and n_slice < 110:
+                        print("Patch start, patch end ", patch_start, patch_end)
 
+                        u, s, vh = xp.linalg.svd(output_part, full_matrices=False)
+
+                        print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
+                        print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
+
+                        if self.normalization:
+                            s = s / self.blk_shape[-1]
+
+                        s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
+
+                        if self.normalization:
+                            s_thresh = s_thresh * self.blk_shape[-1]
+
+                        output_part = (u * s_thresh[..., None, :]) @ vh
+                    output[patch_start:patch_end, ...] = output_part
+
+                output = self.Fwd.H(output)
+                # processed_out.append(backend.to_device(output))
+                processed_out.append(output)
+
+
+            output = np.concatenate(processed_out, axis=2)
+            # output = backend.to_device(output, device=device)
+            # print(output.shape)
             return output * phs
 
     def _linop_randshift(self, shape, blk_shape, randshift):
@@ -457,6 +508,9 @@ class LLRL1Reg(Prox):
         R1 = linop.Reshape(oshape, self.A.oshape)
         R2 = linop.Transpose(R1.oshape, axes=(1, 0, 2))
         return R2 * R1
+    
+    def _check_shape(self, input):
+        pass
 
 
 class SLRMCReg(Prox):
