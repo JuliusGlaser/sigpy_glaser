@@ -683,6 +683,25 @@ def _get_regularization(ishape, regu='TIK', lamda=0,
         # so no need for strength here.
         strength = 0
 
+    elif regu == 'LLR_3dRad':
+
+        blk_shape = list(blk_shape)
+        blk_strides = list(blk_strides)
+
+        for ind in range(len(blk_shape)):
+            if ishape[ind-2] <= blk_shape[ind-2]:
+                blk_shape[ind-2] = ishape[ind-2] // 3
+                blk_strides[ind-2] = ishape[ind-2] // 3
+
+        proxg = sp.prox.LLRL1Reg_3d_Rad(trafos.oshape, lamda,
+                                 blk_shape=blk_shape,
+                                 blk_strides=blk_strides,
+                                 normalization=normalization)
+
+        # the lamda is passed into prox,
+        # so no need for strength here.
+        strength = 0
+
     elif regu == 'SLR':
 
         blk_shape = list(blk_shape)

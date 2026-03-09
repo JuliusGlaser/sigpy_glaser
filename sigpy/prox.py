@@ -336,7 +336,7 @@ class BoxConstraint(Prox):
             return xp.clip(input, self.lower, self.upper)
 
 
-class LLRL1Reg(Prox):
+class LLRL1Reg_3d_Rad(Prox):
     r"""Local Low Rank L1 Regularization
 
     Args:
@@ -467,7 +467,7 @@ class LLRL1Reg(Prox):
                     output_part = output[patch_start:patch_end, ...]
                     output_part = backend.to_device(output_part, device=-1)
                     #apply LLR only on central slices
-                    if n_slice >= 90 and n_slice < 110:
+                    if n_slice >= 80 and n_slice < 130:
 
                         print(f">> SVD on patch {i} of {steps}")
                         # print("Patch start, patch end ", patch_start, patch_end)
