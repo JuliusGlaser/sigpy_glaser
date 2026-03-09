@@ -399,18 +399,18 @@ class LLRL1Reg(Prox):
         self.n_slice_chunk = 10
         shape = shape[0:2] + [self.n_slice_chunk] + shape[-2:]
         
-        print("Shape: ", shape)
-        print("blk_shape", blk_shape)
+        # print("Shape: ", shape)
+        # print("blk_shape", blk_shape)
 
         self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
         self.A = linop.ArrayToBlocks(shape, blk_shape, blk_strides)
         self.Reshape = self._linop_reshape()
 
         self.Fwd = self.Reshape * self.A * self.RandShift
-        print("Fwd inshape: ", self.Fwd.ishape)
-        print("Fwd out shape", self.Fwd.oshape)
-        print("A inshape: ", self.A.ishape)
-        print("A out shape", self.A.oshape)
+        # print("Fwd inshape: ", self.Fwd.ishape)
+        # print("Fwd out shape", self.Fwd.oshape)
+        # print("A inshape: ", self.A.ishape)
+        # print("A out shape", self.A.oshape)
 
         super().__init__(shape)
 
@@ -434,11 +434,13 @@ class LLRL1Reg(Prox):
                 mag = input.copy()
                 phs = xp.ones_like(mag)
 
-            import h5py
-            if self.iter == 4:
-                with h5py.File('/home/vault/mfqb/mfqb102h/RSR_LLR/meas_MID00180_FID03255_Multi_SlidingWindow_1000mum_20k.dat_reconstructed_steps_5_ADMM_total_it_5_lambda_0.0003.h5', 'r+') as f:
-                    f.create_dataset(f'mag_iter_{self.iter}', data=backend.to_device(mag))
-            print("Mag shape: ", mag.shape)
+            #FIXME: transposing not necessary for other reconstruction
+            mag = xp.transpose(mag, (0,1,4,3,2))  # [n_slice, N_diff, N_shot, N_y, N_x]
+
+            # import h5py
+            # with h5py.File(r'C:\Workspace\Temp_dir\RSR_LLR\meas_MID00180_FID03255_Multi_SlidingWindow_1000mum_20k.dat_reconstructed_steps_2_ADMM_total_it_5_lambda_0.001.h5', 'r+') as f:
+            #     f.create_dataset(f'mag_iter_{self.iter}', data=backend.to_device(mag))
+            # print("Mag shape: ", mag.shape)
             processed_out = []
             for n_slice in range(0,self.n_slice, self.n_slice_chunk):
 
@@ -446,7 +448,7 @@ class LLRL1Reg(Prox):
 
                 output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,...])
                 print("SVD computation")
-                print(">>> shape of the array for SVD: ", output.shape)
+                # print(">>> shape of the array for SVD: ", output.shape)
                 
                 n_patches = output.shape[0]
                 # output_comb = xp.zeros_like(output)
@@ -466,12 +468,15 @@ class LLRL1Reg(Prox):
                     output_part = backend.to_device(output_part, device=-1)
                     #apply LLR only on central slices
                     if n_slice >= 90 and n_slice < 110:
-                        print("Patch start, patch end ", patch_start, patch_end)
+
+                        print(f">> SVD on patch {i} of {steps}")
+                        # print("Patch start, patch end ", patch_start, patch_end)
 
                         u, s, vh = np.linalg.svd(output_part, full_matrices=False)
 
+                        
                         print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
-                        print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
+                        # print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
 
                         if self.normalization:
                             s = s / self.blk_shape[-1]
@@ -491,12 +496,9 @@ class LLRL1Reg(Prox):
 
             output = np.concatenate(processed_out, axis=2)
 
-            if self.iter == 4:
-                with h5py.File('/home/vault/mfqb/mfqb102h/RSR_LLR/meas_MID00180_FID03255_Multi_SlidingWindow_1000mum_20k.dat_reconstructed_steps_5_ADMM_total_it_5_lambda_0.0003.h5', 'r+') as f:
-                    f.create_dataset(f'processed_out_iter_{self.iter}', data=backend.to_device(output))
-            # output = backend.to_device(output, device=device)
-            # print(output.shape)
-            self.iter += 1
+            #FIXME: transposing not necessary for other reconstruction
+            output = xp.transpose(output, (0,1,4,3,2))  # [n_slice, N_diff, N_shot, N_y, N_x]
+
             return output * phs
 
     def _linop_randshift(self, shape, blk_shape, randshift):
