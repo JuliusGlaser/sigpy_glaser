@@ -391,6 +391,8 @@ class LLRL1Reg(Prox):
         self.blk_strides = blk_strides
         self.verbose = verbose
 
+        self.iter = 0
+
         # construct forward linops
         # Construct forward slice-wise
         self.n_slice = shape[2]
@@ -418,6 +420,7 @@ class LLRL1Reg(Prox):
     def _prox(self, alpha, input):
         device = backend.get_device(input)
         print("Prox_device = ", device)
+        print("Iter: ", self.iter)
         xp = device.xp
 
         with device:
@@ -431,6 +434,10 @@ class LLRL1Reg(Prox):
                 mag = input.copy()
                 phs = xp.ones_like(mag)
 
+            import h5py
+            if self.iter == 4:
+                with h5py.File('/home/vault/mfqb/mfqb102h/RSR_LLR/meas_MID00180_FID03255_Multi_SlidingWindow_1000mum_20k.dat_reconstructed_steps_5_ADMM_total_it_5_lambda_0.0003.h5', 'r+') as f:
+                    f.create_dataset(f'mag_iter_{self.iter}', data=backend.to_device(mag))
             print("Mag shape: ", mag.shape)
             processed_out = []
             for n_slice in range(0,self.n_slice, self.n_slice_chunk):
@@ -456,11 +463,12 @@ class LLRL1Reg(Prox):
                         patch_end = (i + 1) * (n_patches // steps)
 
                     output_part = output[patch_start:patch_end, ...]
+                    output_part = backend.to_device(output_part, device=-1)
                     #apply LLR only on central slices
                     if n_slice >= 90 and n_slice < 110:
                         print("Patch start, patch end ", patch_start, patch_end)
 
-                        u, s, vh = xp.linalg.svd(output_part, full_matrices=False)
+                        u, s, vh = np.linalg.svd(output_part, full_matrices=False)
 
                         print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
                         print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
@@ -474,7 +482,7 @@ class LLRL1Reg(Prox):
                             s_thresh = s_thresh * self.blk_shape[-1]
 
                         output_part = (u * s_thresh[..., None, :]) @ vh
-                    output[patch_start:patch_end, ...] = output_part
+                    output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
 
                 output = self.Fwd.H(output)
                 # processed_out.append(backend.to_device(output))
@@ -482,8 +490,13 @@ class LLRL1Reg(Prox):
 
 
             output = np.concatenate(processed_out, axis=2)
+
+            if self.iter == 4:
+                with h5py.File('/home/vault/mfqb/mfqb102h/RSR_LLR/meas_MID00180_FID03255_Multi_SlidingWindow_1000mum_20k.dat_reconstructed_steps_5_ADMM_total_it_5_lambda_0.0003.h5', 'r+') as f:
+                    f.create_dataset(f'processed_out_iter_{self.iter}', data=backend.to_device(output))
             # output = backend.to_device(output, device=device)
             # print(output.shape)
+            self.iter += 1
             return output * phs
 
     def _linop_randshift(self, shape, blk_shape, randshift):

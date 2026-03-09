@@ -264,7 +264,7 @@ class LinearLeastSquares(App):
                 )
 
     def _output(self):
-        return self.x * self.scale
+        return self.x * backend.to_device(self.scale, device=backend.get_device(self.x))
 
     def _get_alg(self):
         if self.solver is None:
