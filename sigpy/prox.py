@@ -335,7 +335,132 @@ class BoxConstraint(Prox):
         with device:
             return xp.clip(input, self.lower, self.upper)
 
+class LLRL1Reg(Prox):
+    r"""Local Low Rank L1 Regularization
 
+    Args:
+        shape (tuple of int): input shapes.
+        lamda (float): regularization parameter.
+        randshift (boolean): switch on random shift or not.
+        blk_shape (tuple of int): block shape [default: (8, 8)].
+        blk_strides (tuple of int): block strides [default: (8, 8)].
+
+    References:
+        * Cai JF, Candes EJ, Shen Z.
+          A singular value thresholding algorithm
+          for matrix completion.
+          SIAM J Optim 20:1956-1982 (2010).
+
+        * Trzasko J, Manduca A.
+          Local versus global low-rank promotion
+          in dynamic MRI series reconstruction.
+          Proc. ISMRM 19:4371 (2011).
+
+        * Zhang T, Pauly J, Levesque I.
+          Accelerating parameter mapping with a locally low rank constraint.
+          Magn Reson Med 73:655-661 (2015).
+
+        * Saucedo A, Lefkimmiatis S, Rangwala N, Sung K.
+          Improved computational efficiency of locally low rank
+          MRI reconstruction using iterative random patch adjustments.
+          IEEE Trans Med Imaging 36:1209-1220 (2017).
+
+        * Hu Y, Wang X, Tian Q, Yang G, Daniel B, McNab J, Hargreaves B.
+          Multi-shot diffusion-weighted MRI reconstruction
+          with magnitude-based
+          spatial-angular locally low-rank regularization (SPA-LLR).
+          Magn Reson Med 83:1596-1607 (2020).
+
+    Author:
+        Zhengguo Tan <zhengguo.tan@gmail.com>
+    """
+
+    def __init__(self, shape, lamda, randshift=True,
+                 blk_shape=(8, 8), blk_strides=(8, 8),
+                 reg_magnitude=False,
+                 normalization=False,
+                 verbose=False):
+        self.lamda = lamda
+        self.randshift = randshift
+        self.reg_magnitude = reg_magnitude
+        self.normalization = normalization
+
+        assert len(blk_shape) == len(blk_strides)
+        self.blk_shape = blk_shape
+        self.blk_strides = blk_strides
+        self.verbose = verbose
+
+        # construct forward linops
+        self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
+        self.A = linop.ArrayToBlocks(shape, blk_shape, blk_strides)
+        self.Reshape = self._linop_reshape()
+
+        self.Fwd = self.Reshape * self.A * self.RandShift
+
+        super().__init__(shape)
+
+    def _check_blk(self):
+        assert len(self.blk_shape) == len(self.blk_strides)
+
+    def _prox(self, alpha, input):
+        device = backend.get_device(input)
+        xp = device.xp
+
+        with device:
+
+            if self.reg_magnitude:
+                mag = xp.abs(input)
+                phs = xp.exp(1j * xp.angle(input))
+
+            else:
+                mag = input.copy()
+                phs = xp.ones_like(mag)
+
+            output = self.Fwd(mag)
+
+            output = backend.to_device(output, device=-1)
+
+            u, s, vh = xp.linalg.svd(output, full_matrices=False)
+
+            if self.normalization is True:
+                s = s / self.blk_shape[-1]
+
+            s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
+
+            if self.normalization is True:
+                s_thresh = s_thresh * self.blk_shape[-1]
+
+            output = (u * s_thresh[..., None, :]) @ vh
+
+            output = self.Fwd.H(output)
+
+            output = backend.to_device(output, device=device)
+
+            return output * phs
+
+    def _linop_randshift(self, shape, blk_shape, randshift):
+
+        D = len(blk_shape)
+
+        if randshift is True:
+            axes = range(-D, 0)
+            shift = [random.randint(0, blk_shape[s]) for s in axes]
+
+            return linop.Circshift(shape, shift, axes)
+        else:
+            return linop.Identity(shape)
+
+    def _linop_reshape(self):
+        D = len(self.blk_shape)
+
+        oshape = [util.prod(self.A.ishape[:-D]),
+                  util.prod(self.A.num_blks),
+                  util.prod(self.blk_shape)]
+
+        R1 = linop.Reshape(oshape, self.A.oshape)
+        R2 = linop.Transpose(R1.oshape, axes=(1, 0, 2))
+        return R2 * R1
+    
 class LLRL1Reg_3d_Rad(Prox):
     r"""Local Low Rank L1 Regularization
 
