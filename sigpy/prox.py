@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from sigpy import backend, util, thresh, linop
+import time
 
 
 class Prox(object):
@@ -407,6 +408,7 @@ class LLRL1Reg(Prox):
         xp = device.xp
 
         with device:
+            
 
             if self.reg_magnitude:
                 mag = xp.abs(input)
@@ -418,9 +420,13 @@ class LLRL1Reg(Prox):
 
             output = self.Fwd(mag)
 
+            # t = time.time()
             output = backend.to_device(output, device=-1)
-
-            u, s, vh = xp.linalg.svd(output, full_matrices=False)
+            # print("Time to move data to device: ", time.time()-t)
+            # print("Output device: ", output.device)
+            # t = time.time()
+            u, s, vh = np.linalg.svd(output, full_matrices=False)
+            # print("Time for SVD: ", t-time.time())
 
             if self.normalization is True:
                 s = s / self.blk_shape[-1]
@@ -432,9 +438,9 @@ class LLRL1Reg(Prox):
 
             output = (u * s_thresh[..., None, :]) @ vh
 
-            output = self.Fwd.H(output)
-
             output = backend.to_device(output, device=device)
+
+            output = self.Fwd.H(output)
 
             return output * phs
 
