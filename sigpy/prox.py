@@ -509,6 +509,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
     def __init__(self, shape, lamda, randshift=True,
                  blk_shape=(8, 8), blk_strides=(8, 8),
+                 slices_around_center=0,
                  reg_magnitude=False,
                  normalization=False,
                  verbose=False):
@@ -516,6 +517,7 @@ class LLRL1Reg_3d_Rad(Prox):
         self.randshift = randshift
         self.reg_magnitude = reg_magnitude
         self.normalization = normalization
+        self.slices_around_center = slices_around_center
 
         assert len(blk_shape) == len(blk_strides)
         self.blk_shape = blk_shape
@@ -527,7 +529,9 @@ class LLRL1Reg_3d_Rad(Prox):
         # construct forward linops
         # Construct forward slice-wise
         self.n_slice = shape[2]
-        self.n_slice_chunk = 10
+        if self.slices_around_center == 0:
+            self.slices_around_center = self.n_slice
+        self.n_slice_chunk = 5
         shape = shape[0:2] + [self.n_slice_chunk] + shape[-2:]
         
         # print("Shape: ", shape)
@@ -572,33 +576,35 @@ class LLRL1Reg_3d_Rad(Prox):
             # with h5py.File(r'C:\Workspace\Temp_dir\RSR_LLR\meas_MID00180_FID03255_Multi_SlidingWindow_1000mum_20k.dat_reconstructed_steps_2_ADMM_total_it_5_lambda_0.001.h5', 'r+') as f:
             #     f.create_dataset(f'mag_iter_{self.iter}', data=backend.to_device(mag))
             # print("Mag shape: ", mag.shape)
-            processed_out = []
+            
             for n_slice in range(0,self.n_slice, self.n_slice_chunk):
 
                 print(f">> LLR on slice {n_slice} of {self.n_slice}")
 
-                output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,...])
-                print("SVD computation")
-                # print(">>> shape of the array for SVD: ", output.shape)
-                
-                n_patches = output.shape[0]
-                # output_comb = xp.zeros_like(output)
-                steps = 10
+                if n_slice >= (self.n_slice//2 - self.slices_around_center) and n_slice < (self.n_slice//2 + self.slices_around_center):
+                    #takes time
+                    output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,...])
+                    print("SVD computation")
+                    # print(">>> shape of the array for SVD: ", output.shape)
+                    
+                    n_patches = output.shape[0]
+                    # output_comb = xp.zeros_like(output)
+                    steps = 10
 
-                for i in range(steps):
-                    t = time.time()
+                    for i in range(steps):
+                        t = time.time()
 
-                    patch_start = i * (n_patches // steps)
+                        patch_start = i * (n_patches // steps)
 
-                    if i == steps - 1:
-                        patch_end = n_patches        # last step gets remainder
-                    else:
-                        patch_end = (i + 1) * (n_patches // steps)
+                        if i == steps - 1:
+                            patch_end = n_patches        # last step gets remainder
+                        else:
+                            patch_end = (i + 1) * (n_patches // steps)
 
-                    output_part = output[patch_start:patch_end, ...]
-                    output_part = backend.to_device(output_part, device=-1)
-                    #apply LLR only on central slices
-                    if n_slice >= 80 and n_slice < 130:
+                        output_part = output[patch_start:patch_end, ...]
+                        output_part = backend.to_device(output_part, device=-1)
+                        #apply LLR only on central slices
+                        
 
                         print(f">> SVD on patch {i} of {steps}")
                         # print("Patch start, patch end ", patch_start, patch_end)
@@ -618,19 +624,20 @@ class LLRL1Reg_3d_Rad(Prox):
                             s_thresh = s_thresh * self.blk_shape[-1]
 
                         output_part = (u * s_thresh[..., None, :]) @ vh
-                    output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
 
-                output = self.Fwd.H(output)
+                        output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
+
+                    output = self.Fwd.H(output)
+                else:
+                    output = mag[:,:,n_slice:n_slice+self.n_slice_chunk,...]
                 # processed_out.append(backend.to_device(output))
-                processed_out.append(output)
+                mag[:,:,n_slice:n_slice+self.n_slice_chunk,...] = output
 
-
-            output = np.concatenate(processed_out, axis=2)
 
             #FIXME: transposing not necessary for other reconstruction
-            output = xp.transpose(output, (0,1,4,3,2))  # [n_slice, N_diff, N_shot, N_y, N_x]
+            mag = xp.transpose(mag, (0,1,4,3,2))  # [n_slice, N_diff, N_shot, N_y, N_x]
 
-            return output * phs
+            return mag * phs
 
     def _linop_randshift(self, shape, blk_shape, randshift):
 
