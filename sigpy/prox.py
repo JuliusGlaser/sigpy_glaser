@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from sigpy import backend, util, thresh, linop
 import time
+from multiprocessing import Pool, shared_memory
 
 
 class Prox(object):
@@ -524,6 +525,7 @@ class LLRL1Reg_3d_Rad(Prox):
         self.blk_strides = blk_strides
         self.verbose = verbose
 
+        self.run_svd_parallel = False
         self.iter = 0
 
         # construct forward linops
@@ -551,6 +553,53 @@ class LLRL1Reg_3d_Rad(Prox):
 
     def _check_blk(self):
         assert len(self.blk_shape) == len(self.blk_strides)
+
+    @staticmethod
+    def svd_worker(args):
+        """
+        Each worker:
+        1. Attaches to the shared memory block (no copy of the full array)
+        2. Reads its assigned slice
+        3. Runs SVD + threshold
+        4. Writes the result back in-place
+        """
+        (shm_name, shape, dtype,
+        patch_start, patch_end,
+        lamda, alpha, blk_shape_last, normalization, device) = args
+
+        # Attach to the existing shared memory (created in the main process)
+        existing_shm = shared_memory.SharedMemory(name=shm_name)
+        output = np.ndarray(shape, dtype=dtype, buffer=existing_shm.buf)
+
+        t = time.time()
+        print(f">> SVD on patch [{patch_start}:{patch_end}]")
+
+        # Pull the slice to a local array for SVD (numpy needs a contiguous array)
+        output_part = np.array(output[patch_start:patch_end, ...])
+
+        # Move to CPU if needed — adjust this to your backend's API
+        # output_part = backend.to_device(output_part, device=-1)
+
+        u, s, vh = np.linalg.svd(output_part, full_matrices=False)
+        print(f">>> SVD time [{patch_start}:{patch_end}]: {time.time() - t:.3f}s")
+
+        if normalization:
+            s = s / blk_shape_last
+
+        s_thresh = thresh.soft_thresh(lamda * alpha, s)
+
+        if normalization:
+            s_thresh = s_thresh * blk_shape_last
+
+        result = (u * s_thresh[..., None, :]) @ vh
+
+        # Move back to target device if needed
+        # result = backend.to_device(result, device=device)
+
+        # Write result directly into shared memory
+        output[patch_start:patch_end, ...] = result
+
+        existing_shm.close()  # detach (does NOT free the memory)
 
     def _prox(self, alpha, input):
         device = backend.get_device(input)
@@ -589,43 +638,89 @@ class LLRL1Reg_3d_Rad(Prox):
                     
                     n_patches = output.shape[0]
                     # output_comb = xp.zeros_like(output)
-                    steps = 10
+                    if not self.run_svd_parallel:
+                        steps = 10
 
-                    for i in range(steps):
-                        t = time.time()
+                        for i in range(steps):
+                            t = time.time()
 
-                        patch_start = i * (n_patches // steps)
+                            patch_start = i * (n_patches // steps)
 
-                        if i == steps - 1:
-                            patch_end = n_patches        # last step gets remainder
-                        else:
-                            patch_end = (i + 1) * (n_patches // steps)
+                            if i == steps - 1:
+                                patch_end = n_patches        # last step gets remainder
+                            else:
+                                patch_end = (i + 1) * (n_patches // steps)
 
-                        output_part = output[patch_start:patch_end, ...]
-                        output_part = backend.to_device(output_part, device=-1)
-                        #apply LLR only on central slices
-                        
+                            output_part = output[patch_start:patch_end, ...]
+                            output_part = backend.to_device(output_part, device=-1)
+                            #apply LLR only on central slices
+                            
 
-                        print(f">> SVD on patch {i} of {steps}")
-                        # print("Patch start, patch end ", patch_start, patch_end)
+                            print(f">> SVD on patch {i} of {steps}")
+                            # print("Patch start, patch end ", patch_start, patch_end)
 
-                        u, s, vh = np.linalg.svd(output_part, full_matrices=False)
+                            u, s, vh = np.linalg.svd(output_part, full_matrices=False)
 
-                        
-                        print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
-                        # print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
+                            
+                            print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
+                            # print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
 
-                        if self.normalization:
-                            s = s / self.blk_shape[-1]
+                            if self.normalization:
+                                s = s / self.blk_shape[-1]
 
-                        s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
+                            s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
 
-                        if self.normalization:
-                            s_thresh = s_thresh * self.blk_shape[-1]
+                            if self.normalization:
+                                s_thresh = s_thresh * self.blk_shape[-1]
 
-                        output_part = (u * s_thresh[..., None, :]) @ vh
+                            output_part = (u * s_thresh[..., None, :]) @ vh
 
-                        output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
+                            output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
+                    else:
+                        import psutil
+                        output_np = np.array(backend.to_device(output, device=-1))
+                        steps = psutil.cpu_count(logical=False)-2
+                        n_patches = output_np.shape[0]
+                        # ── 1. Copy `output_np` into a shared memory block ──────────────────────────
+                        #    All worker processes will map this same block — zero extra copies.
+                        shm = shared_memory.SharedMemory(create=True, size=output_np.nbytes)
+                        shared_arr = np.ndarray(output_np.shape, dtype=output_np.dtype, buffer=shm.buf)
+                        shared_arr[:] = output_np          # one-time copy into shared memory
+
+                        # ── 2. Build the argument list for each worker ───────────────────────────
+                        chunk = n_patches // steps
+                        args_list = []
+                        for i in range(steps):
+                            patch_start = i * chunk
+                            patch_end   = n_patches if i == steps - 1 else (i + 1) * chunk
+                            args_list.append((
+                                shm.name,           # workers look up the block by name
+                                output.shape,
+                                output.dtype,
+                                patch_start,
+                                patch_end,
+                                self.lamda,
+                                alpha,
+                                self.blk_shape[-1],      # only the scalar we actually need
+                                self.normalization,
+                                device,
+                            ))
+
+                        # ── 3. Launch all workers simultaneously ─────────────────────────────────
+                        #    Pool size = steps so every patch gets its own process.
+                        #    Cap it at os.cpu_count() if steps is large.
+                        with Pool(processes=steps) as pool:
+                            pool.map(self.svd_worker, args_list)
+
+                        # ── 4. Copy results back from shared memory into the original array ───────
+                        output_np[:] = shared_arr
+
+                        # ── 5. Clean up shared memory ────────────────────────────────────────────
+                        shm.close()
+                        shm.unlink()   # frees the OS-level block; must be called exactly once
+
+                        output = backend.to_device(xp.array(output_np), device=device)
+
 
                     output = self.Fwd.H(output)
                 else:
