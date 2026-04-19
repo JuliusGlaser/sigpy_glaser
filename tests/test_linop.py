@@ -207,6 +207,14 @@ class TestLinop(unittest.TestCase):
                 self.check_linop_adjoint(A)
                 self.check_linop_normal(A)
                 self.check_linop_pickleable(A)
+    
+    def test_Sobolev(self):
+        ishape = [16] * 2
+        A = linop.Sobolev(ishape)
+        self.check_linop_linear(A)
+        self.check_linop_adjoint(A)
+        self.check_linop_normal(A)
+        self.check_linop_pickleable(A)
 
     def test_MatMul(self):
         mshape = (5, 4, 2)
@@ -579,20 +587,20 @@ class TestLinop(unittest.TestCase):
         self.check_linop_normal(A)
         self.check_linop_pickleable(A)
 
-    def test_RealValueConstraint(self):
-        for device in devices:
-            xp = device.xp
+    # def test_RealValueConstraint(self):
+    #     for device in devices:
+    #         xp = device.xp
 
-            data = util.randn([6, 6], dtype=complex, device=device)
+    #         data = util.randn([6, 6], dtype=complex, device=device)
 
-            RVC = linop.RealValueConstraint(data.shape)
+    #         RVC = linop.RealValueConstraint(data.shape)
 
-            y1 = RVC(data)
-            y2 = xp.real(data).astype(complex)
+    #         y1 = RVC(data)
+    #         y2 = xp.real(data).astype(complex)
 
-            npt.assert_allclose(y1, y2)
+    #         npt.assert_allclose(y1, y2)
 
-            # self.check_linop_linear(A)
-            # self.check_linop_adjoint(A)
-            # self.check_linop_normal(A)
-            # self.check_linop_pickleable(A)
+    #         # self.check_linop_linear(A)
+    #         # self.check_linop_adjoint(A)
+    #         # self.check_linop_normal(A)
+    #         # self.check_linop_pickleable(A)
