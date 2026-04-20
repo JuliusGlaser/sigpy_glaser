@@ -585,8 +585,8 @@ class EspiritCalib(sp.app.App):
             self.mps = U[..., :self.sets]
             self.max_eig = S[..., :self.sets]
 
-        print('self.mps ', self.mps.shape)
-        print('self.max_eig ', self.max_eig.shape)
+        # print('self.mps ', self.mps.shape)
+        # print('self.max_eig ', self.max_eig.shape)
 
     def _output(self):
         xp = self.device.xp
