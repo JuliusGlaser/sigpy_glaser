@@ -4,6 +4,7 @@ and provides a few general Apps, including a linear least squares App,
 and a maximum eigenvalue estimation App.
 """
 import time
+from torch import device
 
 from tqdm.auto import tqdm
 
@@ -175,6 +176,7 @@ class LinearLeastSquares(App):
             specified.
         tau (float): Primal step-size for `PrimalDualHybridGradient`.
         sigma (float): Dual step-size for `PrimalDualHybridGradient`.
+        A_one_Device (Linop): Forward linear operator, which does not contain Device changes.
         rho (float): Augmented Lagrangian parameter for `ADMM`.
         max_cg_iter (int): Maximum number of iterations for conjugate gradient
             in ADMM.
@@ -186,12 +188,13 @@ class LinearLeastSquares(App):
                  lamda=0, G=None, g=None, z=None,
                  solver=None, max_iter=100, scale=1,
                  P=None, alpha=None, max_power_iter=30, accelerate=True,
-                 tau=None, sigma=None,
+                 tau=None, sigma=None, A_one_Device=None,
                  rho=1, max_cg_iter=10, tol=0,
                  save_objective_values=False,
                  show_pbar=True, leave_pbar=True,
                  verbose=False):
         self.A = A
+        self.A_one_Device = A_one_Device
         self.y = y
         self.x = x
         self.scale = scale
@@ -290,7 +293,11 @@ class LinearLeastSquares(App):
         elif self.solver == "PrimalDualHybridGradient":
             self._get_PrimalDualHybridGradient()
         elif self.solver == "ADMM":
-            self._get_ADMM()
+            if self.A_one_Device is not None:
+                print("Using special ADMM formulation for 3d radial LLR")
+                self._get_ADMM_3d_rad()
+            else:
+                self._get_ADMM()
         else:
             raise ValueError(
                 "Invalid solver: {solver}.".format(solver=self.solver)
@@ -466,10 +473,12 @@ class LinearLeastSquares(App):
 
                 AHA += self.rho * self.G.H * self.G
 
+            CG_time = time.time()
             App(ConjugateGradient(AHA, AHy, self.x, P=self.P,
                                   max_iter=self.max_cg_iter,
                                   verbose=self.verbose),
-                show_pbar=False).run()
+                            show_pbar=False).run()
+            print(f"Iteration time CG: {(time.time() - CG_time)//60:.0f}:{(time.time() - CG_time)%60:02.0f} min")
 
         def minL_v():
 
@@ -516,6 +525,162 @@ class LinearLeastSquares(App):
         self.alg = ADMM(
             minL_x, minL_v, self.x, v, u, G, -I_v, 0, max_iter=self.max_iter
         )
+
+    def _get_ADMM_3d_rad(self):
+        r"""Considers the formulation:
+
+        .. math::
+            \min_{x, v: G x = v} \frac{1}{2} \|A x - y\|_2^2 +
+            \frac{\lambda}{2} \| x - z \|_2^2 + g(v)
+
+            special formulation of ADMM to let CG steps run completely on GPU seperate along contrast dim to reduce computational load
+            Author: Julius Glaser
+        """
+        ABSTOL = 1E-4
+        RELTOL = 1E-3
+
+        xp = self.x_device.xp
+        with self.x_device:
+            if self.G is None:
+                v = self.x.copy()
+            else:
+                v = self.G(self.x)
+
+            u = xp.zeros_like(v)
+
+        def minL_x():
+            r"""Here we have a special definition for minL_x
+            because the big ADMM steps for LLR run on all contrast at once we run into memory trouble for large 3d datasets.
+            Therefore ADMM steps need to be run on CPU because x is too large to be stored on GPU
+            But CG steps can be run enterily on GPU, because contrasts are independent here so we change the formulation of minL_x
+            to run sequentially along contrast dim and store outputs again in the final x array on CPU
+            Teherefore all used operators need to be adapted to be defined on single TEs
+            This means A, y, x, z, P and G all need to be defined for their regarding TE
+            """
+            iter_t = time.time()
+            for TE, A_TE in enumerate(self.A_one_Device.linops):
+
+                #rebuild G for G_te
+                ishape = A_TE.ishape
+                ro_extend_fold = 1  #FIXME: that might not always be true
+                regu_kspace = False #FIXME: for different regs this might not be true, but as this is intended for LLR it should be fine
+                
+                if G is not None:
+                    G_TE = build_G_te(ishape, ro_extend_fold, regu_kspace)
+                if self.P is not None:
+                    print('P is not None??? FIXME!!!')
+
+                # move y, x, v, u to GPU for this TE
+                y_TE  = backend.to_device(self.y[[TE],...], device=backend.Device(0))
+                x_TE = backend.to_device(self.x[[TE],...], device=backend.Device(0))
+                v_TE = backend.to_device(v[[TE],...], device=backend.Device(0))
+                u_TE = backend.to_device(u[[TE],...], device=backend.Device(0))
+                if self.z is not None:
+                    z_TE = backend.to_device(self.z[[TE],...], device=backend.Device(0))
+
+                AHy = A_TE.H * y_TE
+                if self.G is None:
+                    AHy += self.rho * (v_TE - u_TE)
+                else:
+                    AHy += self.rho * G_TE.H(v_TE - u_TE)
+
+                if self.z is not None:
+                    AHy += self.lamda * z_TE
+
+                AHA = A_TE.N
+                Id = linop.Identity(x_TE.shape)
+                if self.G is None:
+                    AHA += (self.lamda + self.rho) * Id
+                else:
+                    if self.lamda > 0:
+                        AHA += self.lamda * Id
+
+                    AHA += self.rho * G_TE.H * G_TE
+
+                
+                App(ConjugateGradient(AHA, AHy, x_TE, P=self.P,
+                                    max_iter=self.max_cg_iter,
+                                    verbose=False),
+                    show_pbar=False).run()
+                # while not iterative_solver.alg.done():
+                #     # iter_t = time.time()
+                #     iterative_solver.alg.update()
+                
+                # x_res = backend.to_device(x_res, device=backend.get_device(self.x))
+                self.x[TE,...] = backend.to_device(x_TE, device=backend.get_device(self.x))
+            print(f"Iteration time CG: {(time.time() - iter_t)//60:.0f}:{(time.time() - iter_t)%60:02.0f} min")
+
+
+        def minL_v():
+
+            self.iter_step += 1
+            v_old = v.copy()
+
+            if self.G is None:
+                backend.copyto(v, self.x + u)
+            else:
+                backend.copyto(v, self.G(self.x) + u)
+
+            if self.proxg is not None:
+                backend.copyto(v, self.proxg(1 / self.rho, v))
+
+            if self.verbose:
+                with self.x_device:
+                    Gx = self.G(self.x)
+
+                    r_norm = xp.linalg.norm(Gx - v).item()
+                    s_norm = xp.linalg.norm(-self.rho * (v - v_old)).item()
+
+                    r_scaling = max(xp.linalg.norm(Gx).item(),
+                                    xp.linalg.norm(v).item())
+                    s_scaling = self.rho * xp.linalg.norm(u).item()
+
+                eps_pri = ABSTOL * (np.prod(v.shape)**0.5) \
+                    + RELTOL * r_scaling
+                eps_dual = ABSTOL * (np.prod(v.shape)**0.5) \
+                    + RELTOL * s_scaling
+
+                print('admm iter: ' + "%2d" % (self.iter_step) +
+                      ', r norm: ' + "%10.4f" % (r_norm) +
+                      ', eps pri: ' + "%10.4f" % (eps_pri) +
+                      ', s norm: ' + "%10.4f" % (s_norm) +
+                      ', eps dual: ' + "%10.4f" % (eps_dual))
+
+        I_v = linop.Identity(v.shape)
+        if self.G is None:
+            I_x = linop.Identity(self.x.shape)
+            G = I_x
+        else:
+            G = self.G
+
+        self.alg = ADMM(
+            minL_x, minL_v, self.x, v, u, G, -I_v, 0, max_iter=self.max_iter
+        )
+
+        def build_G_te(ishape, ro_extend_fold, regu_kspace):
+            idx = []
+            for n in range(-len(ishape), -1, 1):
+                idx.append(slice(0, ishape[n], 1))
+
+            Nx_ext = ishape[-1]
+            Nx = Nx_ext // ro_extend_fold
+
+            Slices = []
+            for n in range(ro_extend_fold):
+                idn = idx.copy()
+                idn.append(slice(n * Nx, (n+1) * Nx, 1))
+
+                Slices.append(linop.Slice(ishape, tuple(idn)))
+
+            G_TE = linop.Vstack(Slices, axis=0)
+
+
+            if regu_kspace is True:
+                G_TE = linop.FFT(G_TE.oshape, axes=[-2, -1]) * G_TE
+            else:
+                G_TE = linop.Identity(G_TE.oshape) * G_TE
+
+            return G_TE
 
     def objective(self):
         with self.y_device:

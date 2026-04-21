@@ -533,7 +533,7 @@ class LLRL1Reg_3d_Rad(Prox):
         self.n_slice = shape[2]
         if self.slices_around_center == 0:
             self.slices_around_center = self.n_slice
-        self.n_slice_chunk = 5
+        self.n_slice_chunk = 1
         shape = shape[0:2] + [self.n_slice_chunk] + shape[-2:]
         
         # print("Shape: ", shape)
@@ -603,9 +603,11 @@ class LLRL1Reg_3d_Rad(Prox):
 
     def _prox(self, alpha, input):
         device = backend.get_device(input)
-        print("Prox_device = ", device)
+        # print("Prox_device = ", device)
         print("Iter: ", self.iter)
         xp = device.xp
+
+        LLR_time = time.time()
 
         with device:
             import time
@@ -628,12 +630,12 @@ class LLRL1Reg_3d_Rad(Prox):
             
             for n_slice in range(0,self.n_slice, self.n_slice_chunk):
 
-                print(f">> LLR on slice {n_slice} of {self.n_slice}")
+                # print(f">> LLR on slice {n_slice} of {self.n_slice}")
 
                 if n_slice >= (self.n_slice//2 - self.slices_around_center) and n_slice < (self.n_slice//2 + self.slices_around_center):
                     #takes time
                     output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,...])
-                    print("SVD computation")
+                    # print("SVD computation")
                     # print(">>> shape of the array for SVD: ", output.shape)
                     
                     n_patches = output.shape[0]
@@ -656,13 +658,13 @@ class LLRL1Reg_3d_Rad(Prox):
                             #apply LLR only on central slices
                             
 
-                            print(f">> SVD on patch {i} of {steps}")
+                            # print(f">> SVD on patch {i} of {steps}")
                             # print("Patch start, patch end ", patch_start, patch_end)
 
                             u, s, vh = np.linalg.svd(output_part, full_matrices=False)
 
                             
-                            print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
+                            # print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
                             # print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
 
                             if self.normalization:
@@ -679,7 +681,8 @@ class LLRL1Reg_3d_Rad(Prox):
                     else:
                         import psutil
                         output_np = np.array(backend.to_device(output, device=-1))
-                        steps = psutil.cpu_count(logical=False)-2
+                        steps = 10#psutil.cpu_count(logical=False)//2-4 #For HPC 'FIXME: make config parameter for N_kernels
+                        print(f">> running on {steps} kernels in parallel")
                         n_patches = output_np.shape[0]
                         # ── 1. Copy `output_np` into a shared memory block ──────────────────────────
                         #    All worker processes will map this same block — zero extra copies.
@@ -731,6 +734,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
             #FIXME: transposing not necessary for other reconstruction
             mag = xp.transpose(mag, (0,1,4,3,2))  # [n_slice, N_diff, N_shot, N_y, N_x]
+            print(f"LLR time: {(time.time() - LLR_time)//60:.0f}:{(time.time() - LLR_time)%60:02.0f} min")
 
             return mag * phs
 
