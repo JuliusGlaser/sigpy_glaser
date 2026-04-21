@@ -602,6 +602,7 @@ class LLRL1Reg_3d_Rad(Prox):
         existing_shm.close()  # detach (does NOT free the memory)
 
     def _prox(self, alpha, input):
+        import time
         device = backend.get_device(input)
         # print("Prox_device = ", device)
         print("Iter: ", self.iter)
@@ -610,7 +611,7 @@ class LLRL1Reg_3d_Rad(Prox):
         LLR_time = time.time()
 
         with device:
-            import time
+            
 
             if self.reg_magnitude:
                 mag = xp.abs(input)
@@ -644,7 +645,6 @@ class LLRL1Reg_3d_Rad(Prox):
                         steps = 10
 
                         for i in range(steps):
-                            t = time.time()
 
                             patch_start = i * (n_patches // steps)
 
