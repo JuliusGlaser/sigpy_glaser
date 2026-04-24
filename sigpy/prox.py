@@ -3,6 +3,7 @@
 and provides commonly used proximal operators, including soft-thresholding,
 l1 ball projection, and box constraints.
 """
+from re import S
 import numpy as np
 import random
 import torch
@@ -506,11 +507,13 @@ class LLRL1Reg_3d_Rad(Prox):
 
     Author:
         Zhengguo Tan <zhengguo.tan@gmail.com>
+        Julius Glaer <julius-glaser@gmx.de>
     """
 
     def __init__(self, shape, lamda, randshift=True,
                  blk_shape=(8, 8), blk_strides=(8, 8),
                  slices_around_center=0,
+                 bounding_box=None,
                  reg_magnitude=False,
                  normalization=False,
                  verbose=False):
@@ -533,8 +536,17 @@ class LLRL1Reg_3d_Rad(Prox):
         self.n_slice = shape[2]
         if self.slices_around_center == 0:
             self.slices_around_center = self.n_slice
-        self.n_slice_chunk = 1
-        shape = shape[0:2] + [self.n_slice_chunk] + shape[-2:]
+        if bounding_box is not None:
+            slice_x = slice(bounding_box[0][0], bounding_box[2][0])     #Just using one arbitrary bounding_box because the operator needs a constant size
+            slice_y = slice(bounding_box[1][0], bounding_box[3][0])     # could be fixed by using multiple operators for different slices, but this is not implemented yet
+        else:
+            slice_x = slice(0, shape[-2])
+            slice_y = slice(0, shape[-1])
+        self.n_slice_chunk = self.blk_shape[0]
+        shape = shape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
+
+        self.slice_x = slice_x
+        self.slice_y = slice_y
         
         # print("Shape: ", shape)
         # print("blk_shape", blk_shape)
@@ -635,7 +647,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
                 if n_slice >= (self.n_slice//2 - self.slices_around_center) and n_slice < (self.n_slice//2 + self.slices_around_center):
                     #takes time
-                    output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,...])
+                    output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
                     # print("SVD computation")
                     # print(">>> shape of the array for SVD: ", output.shape)
                     
@@ -725,7 +737,9 @@ class LLRL1Reg_3d_Rad(Prox):
                         output = backend.to_device(xp.array(output_np), device=device)
 
 
-                    output = self.Fwd.H(output)
+                    output_LLR = self.Fwd.H(output)
+                    output = mag[:,:,n_slice:n_slice+self.n_slice_chunk,...]    #extend FOV if bounding_box is used with original data
+                    output[...,self.slice_y, self.slice_x] = output_LLR
                 else:
                     output = mag[:,:,n_slice:n_slice+self.n_slice_chunk,...]
                 # processed_out.append(backend.to_device(output))
