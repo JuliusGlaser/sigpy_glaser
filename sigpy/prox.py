@@ -4,6 +4,7 @@ and provides commonly used proximal operators, including soft-thresholding,
 l1 ball projection, and box constraints.
 """
 from re import S
+from typing import final
 import numpy as np
 import random
 import torch
@@ -512,6 +513,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
     def __init__(self, shape, lamda, randshift=True,
                  blk_shape=(8, 8), blk_strides=(8, 8),
+                 contrast_step_size=None, contrast_step_stride=None,
                  slices_around_center=0,
                  bounding_box=None,
                  reg_magnitude=False,
@@ -531,6 +533,13 @@ class LLRL1Reg_3d_Rad(Prox):
         self.run_svd_parallel = False
         self.iter = 0
 
+        self.contrast_step_size = contrast_step_size
+        self.contrast_step_stride = contrast_step_stride
+        self.N_echo = 6
+        self.windows_per_echo = 20
+        print(contrast_step_size)
+        print(contrast_step_stride)
+
         # construct forward linops
         # Construct forward slice-wise
         self.n_slice = shape[2]
@@ -543,8 +552,15 @@ class LLRL1Reg_3d_Rad(Prox):
             slice_x = slice(0, shape[-2])
             slice_y = slice(0, shape[-1])
         self.n_slice_chunk = self.blk_shape[0]
-        shape = shape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
-
+        
+        print(shape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start])
+        if self.contrast_step_size is None:
+            shape = shape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
+        else:
+            shape = [contrast_step_size*self.N_echo] + [shape[1]] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
+        
+        
+        #print(shape)
         self.slice_x = slice_x
         self.slice_y = slice_y
         
@@ -556,8 +572,8 @@ class LLRL1Reg_3d_Rad(Prox):
         self.Reshape = self._linop_reshape()
 
         self.Fwd = self.Reshape * self.A * self.RandShift
-        # print("Fwd inshape: ", self.Fwd.ishape)
-        # print("Fwd out shape", self.Fwd.oshape)
+        print("Fwd inshape: ", self.Fwd.ishape)
+        print("Fwd out shape", self.Fwd.oshape)
         # print("A inshape: ", self.A.ishape)
         # print("A out shape", self.A.oshape)
 
@@ -566,6 +582,31 @@ class LLRL1Reg_3d_Rad(Prox):
     def _check_blk(self):
         assert len(self.blk_shape) == len(self.blk_strides)
 
+    def getContrastSlicedMag(self, mag, start_idx, xp):
+        sliced_mag = xp.zeros(shape = tuple([self.contrast_step_size*self.N_echo] + [mag.shape[1]] + [mag.shape[2]] + [mag.shape[3]] + [mag.shape[4]]), dtype=mag.dtype)
+        n_TE = 0
+        windows_per_echo = self.windows_per_echo
+        for TE in range(start_idx, mag.shape[0]-self.contrast_step_size-start_idx):
+            if TE%windows_per_echo == 0:
+                n_TE += 1
+            if TE-n_TE*windows_per_echo-start_idx < 6:
+                sliced_mag[TE-n_TE*windows_per_echo+n_TE*self.contrast_step_size,...] = mag[TE+start_idx,...]
+        return sliced_mag
+    
+    def sortSlicedIntoFinalOut(self, final_output, LLR_output, start_idx):
+        n_TE = -1
+        windows_per_echo = self.windows_per_echo
+        sliced_counter = 0
+        for TE in range(start_idx, final_output.shape[0]-self.contrast_step_size-start_idx):
+            if TE%windows_per_echo == 0:
+                n_TE += 1
+            if TE-n_TE*windows_per_echo-start_idx < 6:
+                # print(final_output.shape)
+                # print(LLR_output.shape)
+                final_output[TE+start_idx,:,:,self.slice_y, self.slice_x] = LLR_output[sliced_counter,...]
+                sliced_counter += 1
+        return final_output
+    
     @staticmethod
     def svd_worker(args):
         """
@@ -635,6 +676,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
             #FIXME: transposing not necessary for other reconstruction
             mag = xp.transpose(mag, (0,1,4,3,2))  # [n_slice, N_diff, N_shot, N_y, N_x]
+            print("Mag shape after transpose: ", mag.shape)
 
             # import h5py
             # with h5py.File(r'C:\Workspace\Temp_dir\RSR_LLR\meas_MID00180_FID03255_Multi_SlidingWindow_1000mum_20k.dat_reconstructed_steps_2_ADMM_total_it_5_lambda_0.001.h5', 'r+') as f:
@@ -647,99 +689,160 @@ class LLRL1Reg_3d_Rad(Prox):
 
                 if n_slice >= (self.n_slice//2 - self.slices_around_center) and n_slice < (self.n_slice//2 + self.slices_around_center):
                     #takes time
-                    output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
-                    # print("SVD computation")
-                    # print(">>> shape of the array for SVD: ", output.shape)
-                    
-                    n_patches = output.shape[0]
-                    # output_comb = xp.zeros_like(output)
-                    if not self.run_svd_parallel:
-                        steps = 10
+                    if self.contrast_step_size is None:
+                        output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
+                        # print("SVD computation")
+                        # print(">>> shape of the array for SVD: ", output.shape)
+                        
+                        n_patches = output.shape[0]
+                        # output_comb = xp.zeros_like(output)
+                        if not self.run_svd_parallel:
+                            steps = 10
 
-                        for i in range(steps):
+                            for i in range(steps):
 
-                            patch_start = i * (n_patches // steps)
+                                patch_start = i * (n_patches // steps)
 
-                            if i == steps - 1:
-                                patch_end = n_patches        # last step gets remainder
-                            else:
-                                patch_end = (i + 1) * (n_patches // steps)
+                                if i == steps - 1:
+                                    patch_end = n_patches        # last step gets remainder
+                                else:
+                                    patch_end = (i + 1) * (n_patches // steps)
 
-                            output_part = output[patch_start:patch_end, ...]
-                            output_part = backend.to_device(output_part, device=-1)
-                            #apply LLR only on central slices
-                            
+                                output_part = output[patch_start:patch_end, ...]
+                                output_part = backend.to_device(output_part, device=-1)
+                                #apply LLR only on central slices
+                                
 
-                            # print(f">> SVD on patch {i} of {steps}")
-                            # print("Patch start, patch end ", patch_start, patch_end)
+                                # print(f">> SVD on patch {i} of {steps}")
+                                # print("Patch start, patch end ", patch_start, patch_end)
 
-                            u, s, vh = np.linalg.svd(output_part, full_matrices=False)
+                                u, s, vh = np.linalg.svd(output_part, full_matrices=False)
 
-                            
-                            # print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
-                            # print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
+                                
+                                # print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
+                                # print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
 
-                            if self.normalization:
-                                s = s / self.blk_shape[-1]
+                                if self.normalization:
+                                    s = s / self.blk_shape[-1]
 
-                            s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
+                                s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
 
-                            if self.normalization:
-                                s_thresh = s_thresh * self.blk_shape[-1]
+                                if self.normalization:
+                                    s_thresh = s_thresh * self.blk_shape[-1]
 
-                            output_part = (u * s_thresh[..., None, :]) @ vh
+                                output_part = (u * s_thresh[..., None, :]) @ vh
 
-                            output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
+                                output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
+                        else:
+                            import psutil
+                            output_np = np.array(backend.to_device(output, device=-1))
+                            steps = 10#psutil.cpu_count(logical=False)//2-4 #For HPC 'FIXME: make config parameter for N_kernels
+                            print(f">> running on {steps} kernels in parallel")
+                            n_patches = output_np.shape[0]
+                            # ── 1. Copy `output_np` into a shared memory block ──────────────────────────
+                            #    All worker processes will map this same block — zero extra copies.
+                            shm = shared_memory.SharedMemory(create=True, size=output_np.nbytes)
+                            shared_arr = np.ndarray(output_np.shape, dtype=output_np.dtype, buffer=shm.buf)
+                            shared_arr[:] = output_np          # one-time copy into shared memory
+
+                            # ── 2. Build the argument list for each worker ───────────────────────────
+                            chunk = n_patches // steps
+                            args_list = []
+                            for i in range(steps):
+                                patch_start = i * chunk
+                                patch_end   = n_patches if i == steps - 1 else (i + 1) * chunk
+                                args_list.append((
+                                    shm.name,           # workers look up the block by name
+                                    output.shape,
+                                    output.dtype,
+                                    patch_start,
+                                    patch_end,
+                                    self.lamda,
+                                    alpha,
+                                    self.blk_shape[-1],      # only the scalar we actually need
+                                    self.normalization,
+                                    device,
+                                ))
+
+                            # ── 3. Launch all workers simultaneously ─────────────────────────────────
+                            #    Pool size = steps so every patch gets its own process.
+                            #    Cap it at os.cpu_count() if steps is large.
+                            with Pool(processes=steps) as pool:
+                                pool.map(self.svd_worker, args_list)
+
+                            # ── 4. Copy results back from shared memory into the original array ───────
+                            output_np[:] = shared_arr
+
+                            # ── 5. Clean up shared memory ────────────────────────────────────────────
+                            shm.close()
+                            shm.unlink()   # frees the OS-level block; must be called exactly once
+
+                            output = backend.to_device(xp.array(output_np), device=device)
+
+
+                        output_LLR = self.Fwd.H(output)
+                        output = mag[:,:,n_slice:n_slice+self.n_slice_chunk,...]    #extend FOV if bounding_box is used with original data
+                        output[...,self.slice_y, self.slice_x] = output_LLR
                     else:
-                        import psutil
-                        output_np = np.array(backend.to_device(output, device=-1))
-                        steps = 10#psutil.cpu_count(logical=False)//2-4 #For HPC 'FIXME: make config parameter for N_kernels
-                        print(f">> running on {steps} kernels in parallel")
-                        n_patches = output_np.shape[0]
-                        # ── 1. Copy `output_np` into a shared memory block ──────────────────────────
-                        #    All worker processes will map this same block — zero extra copies.
-                        shm = shared_memory.SharedMemory(create=True, size=output_np.nbytes)
-                        shared_arr = np.ndarray(output_np.shape, dtype=output_np.dtype, buffer=shm.buf)
-                        shared_arr[:] = output_np          # one-time copy into shared memory
+                        # sliding window on contrast dimension
+                        full_steps = mag.shape[0]
+                        N_contrast_windows = self.windows_per_echo // self.contrast_step_stride
+                        final_output = mag[...,n_slice:n_slice+self.n_slice_chunk,:,:]
 
-                        # ── 2. Build the argument list for each worker ───────────────────────────
-                        chunk = n_patches // steps
-                        args_list = []
-                        for i in range(steps):
-                            patch_start = i * chunk
-                            patch_end   = n_patches if i == steps - 1 else (i + 1) * chunk
-                            args_list.append((
-                                shm.name,           # workers look up the block by name
-                                output.shape,
-                                output.dtype,
-                                patch_start,
-                                patch_end,
-                                self.lamda,
-                                alpha,
-                                self.blk_shape[-1],      # only the scalar we actually need
-                                self.normalization,
-                                device,
-                            ))
+                        for w in range(N_contrast_windows):
+                            
+                            sliced_mag = self.getContrastSlicedMag(mag=mag, start_idx=w*self.contrast_step_stride, xp=xp)
+                            output = self.Fwd(sliced_mag[...,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
+                            print(">> Processing contrast window {}/{}".format(w+1, N_contrast_windows))
+                            # print("SVD computation")
+                            # print(">>> shape of the array for SVD: ", output.shape)
+                            
+                            n_patches = output.shape[0]
+                            # output_comb = xp.zeros_like(output)
+                            steps = 10
 
-                        # ── 3. Launch all workers simultaneously ─────────────────────────────────
-                        #    Pool size = steps so every patch gets its own process.
-                        #    Cap it at os.cpu_count() if steps is large.
-                        with Pool(processes=steps) as pool:
-                            pool.map(self.svd_worker, args_list)
+                            for i in range(steps):
 
-                        # ── 4. Copy results back from shared memory into the original array ───────
-                        output_np[:] = shared_arr
+                                patch_start = i * (n_patches // steps)
 
-                        # ── 5. Clean up shared memory ────────────────────────────────────────────
-                        shm.close()
-                        shm.unlink()   # frees the OS-level block; must be called exactly once
+                                if i == steps - 1:
+                                    patch_end = n_patches        # last step gets remainder
+                                else:
+                                    patch_end = (i + 1) * (n_patches // steps)
 
-                        output = backend.to_device(xp.array(output_np), device=device)
+                                output_part = output[patch_start:patch_end, ...]
+                                output_part = backend.to_device(output_part, device=-1)
+                                #apply LLR only on central slices
+                                
 
+                                # print(f">> SVD on patch {i} of {steps}")
+                                # print("Patch start, patch end ", patch_start, patch_end)
 
-                    output_LLR = self.Fwd.H(output)
-                    output = mag[:,:,n_slice:n_slice+self.n_slice_chunk,...]    #extend FOV if bounding_box is used with original data
-                    output[...,self.slice_y, self.slice_x] = output_LLR
+                                u, s, vh = np.linalg.svd(output_part, full_matrices=False)
+
+                                
+                                # print('>>> SVD time: ' + str(time.time() - t) + ' seconds.')
+                                # print("SVD component shapes: u {}, s {}, vh {}".format(u.shape, s.shape, vh.shape))
+
+                                if self.normalization:
+                                    s = s / self.blk_shape[-1]
+
+                                s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
+
+                                if self.normalization:
+                                    s_thresh = s_thresh * self.blk_shape[-1]
+
+                                output_part = (u * s_thresh[..., None, :]) @ vh
+
+                                output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
+
+                            output_LLR = self.Fwd.H(output)
+
+                            final_output = self.sortSlicedIntoFinalOut(final_output=final_output, LLR_output=output_LLR, start_idx=w*self.contrast_step_stride)
+                        output = final_output
+                        print(output.shape)
+
+                            
                 else:
                     output = mag[:,:,n_slice:n_slice+self.n_slice_chunk,...]
                 # processed_out.append(backend.to_device(output))
