@@ -583,14 +583,17 @@ class LLRL1Reg_3d_Rad(Prox):
         assert len(self.blk_shape) == len(self.blk_strides)
 
     def getContrastSlicedMag(self, mag, start_idx, xp):
-        sliced_mag = xp.zeros(shape = tuple([self.contrast_step_size*self.N_echo] + [mag.shape[1]] + [mag.shape[2]] + [mag.shape[3]] + [mag.shape[4]]), dtype=mag.dtype)
-        n_TE = 0
+        # print(start_idx)
+        sliced_mag = np.zeros(shape = tuple([self.contrast_step_size*self.N_echo] + [mag.shape[1]] + [mag.shape[2]] + [mag.shape[3]] + [mag.shape[4]]), dtype=mag.dtype)
+        n_TE = -1
         windows_per_echo = self.windows_per_echo
-        for TE in range(start_idx, mag.shape[0]-self.contrast_step_size-start_idx):
-            if TE%windows_per_echo == 0:
+        for TE in range(start_idx, mag.shape[0]):
+            # print(TE)
+            if (TE-start_idx)%windows_per_echo == 0:
                 n_TE += 1
-            if TE-n_TE*windows_per_echo-start_idx < 6:
-                sliced_mag[TE-n_TE*windows_per_echo+n_TE*self.contrast_step_size,...] = mag[TE+start_idx,...]
+                # print(n_TE)
+            if TE-start_idx-n_TE*windows_per_echo < 6:
+                sliced_mag[TE-start_idx-n_TE*windows_per_echo+n_TE*self.contrast_step_size,...] = mag[TE,...]
         return sliced_mag
     
     def sortSlicedIntoFinalOut(self, final_output, LLR_output, start_idx):
