@@ -628,6 +628,7 @@ def _get_regularization(ishape, regu='TIK', lamda=0,
                         slices_around_center=0,
                         con_step = None,
                         con_stride = None,
+                        use_con_mask = False,
                         bounding_box = None,
                         normalization=False,
                         thresh='soft',
@@ -698,13 +699,14 @@ def _get_regularization(ishape, regu='TIK', lamda=0,
                 blk_strides[ind-2] = ishape[ind-2] // 3
 
         proxg = sp.prox.LLRL1Reg_3d_Rad(trafos.oshape, lamda,
-                                 blk_shape=blk_shape,
-                                 blk_strides=blk_strides,
-                                 slices_around_center=slices_around_center,
-                                 contrast_step_size=con_step, 
-                                 contrast_step_stride=con_stride,
-                                 bounding_box=bounding_box,
-                                 normalization=normalization)
+                                        blk_shape=blk_shape,
+                                        blk_strides=blk_strides,
+                                        slices_around_center=slices_around_center,
+                                        contrast_step_size=con_step, 
+                                        contrast_step_stride=con_stride,
+                                        use_contrast_mask=use_con_mask,
+                                        bounding_box=bounding_box,
+                                        normalization=normalization)
 
         # the lamda is passed into prox,
         # so no need for strength here.

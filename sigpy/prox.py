@@ -6,6 +6,7 @@ l1 ball projection, and box constraints.
 from re import S
 from typing import final
 import numpy as np
+import h5py
 import random
 import torch
 import torch.nn as nn
@@ -511,9 +512,10 @@ class LLRL1Reg_3d_Rad(Prox):
         Julius Glaer <julius-glaser@gmx.de>
     """
 
-    def __init__(self, shape, lamda, randshift=True,
+    def __init__(self, ishape, lamda, randshift=True,
                  blk_shape=(8, 8), blk_strides=(8, 8),
                  contrast_step_size=None, contrast_step_stride=None,
+                 use_contrast_mask=False,
                  slices_around_center=0,
                  bounding_box=None,
                  reg_magnitude=False,
@@ -536,28 +538,37 @@ class LLRL1Reg_3d_Rad(Prox):
         self.contrast_step_size = contrast_step_size
         self.contrast_step_stride = contrast_step_stride
         self.N_echo = 6
-        self.windows_per_echo = 20        #FIXME: hardcoded +3
+        self.windows_per_echo = 20
+        self.use_contrast_mask = use_contrast_mask
+        #FIXME: Hardcoded load function:
+        with h5py.File(r'/home/vault/mfqb/mfqb102h/RSR_LLR/mask_window_selection_117.h5', 'r') as f:
+            self.contrast_mask = f['mask_window_selection'][...]
 
         # construct forward linops
         # Construct forward slice-wise
-        self.n_slice = shape[2]
+        self.n_slice = ishape[2]
         if self.slices_around_center == 0:
             self.slices_around_center = self.n_slice
         if bounding_box is not None:
             slice_x = slice(bounding_box[0][0], bounding_box[2][0])     #Just using one arbitrary bounding_box because the operator needs a constant size
             slice_y = slice(bounding_box[1][0], bounding_box[3][0])     # could be fixed by using multiple operators for different slices, but this is not implemented yet
         else:
-            slice_x = slice(0, shape[-2])
-            slice_y = slice(0, shape[-1])
+            slice_x = slice(0, ishape[-2])
+            slice_y = slice(0, ishape[-1])
         self.n_slice_chunk = self.blk_shape[0]
         
         # print(shape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start])
-        if self.contrast_step_size is None:
-            shape = shape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
+        if self.contrast_step_size is None and not use_contrast_mask:
+            shape = ishape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
+        elif use_contrast_mask:
+            print(">> Using contrast mask ")
+            shape = []
+            for i in range(self.contrast_mask.shape[1]):
+                shape.append([np.sum(self.contrast_mask[:,i])] + [ishape[1]] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start])
         else:
-            shape = [contrast_step_size*self.N_echo] + [shape[1]] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
+            shape = [contrast_step_size*self.N_echo] + [ishape[1]] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
             if self.windows_per_echo % self.contrast_step_stride != 0:
-                shape2 = [(self.windows_per_echo % self.contrast_step_stride)*self.N_echo] + [shape[1]] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
+                shape2 = [(self.windows_per_echo % self.contrast_step_stride)*self.N_echo] + [ishape[1]] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start]
         
         
         #print(shape)
@@ -566,20 +577,34 @@ class LLRL1Reg_3d_Rad(Prox):
         
         # print("Shape: ", shape)
         # print("blk_shape", blk_shape)
+        if self.contrast_step_size is None and not use_contrast_mask:
+            self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
+            self.A = linop.ArrayToBlocks(shape, blk_shape, blk_strides)
+            self.Reshape = self._linop_reshape(self.A)
 
-        self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
-        self.A = linop.ArrayToBlocks(shape, blk_shape, blk_strides)
-        self.Reshape = self._linop_reshape(self.A)
+            self.Fwd = self.Reshape * self.A * self.RandShift
 
-        self.Fwd = self.Reshape * self.A * self.RandShift
+        elif self.contrast_step_size is not None and not use_contrast_mask:
+            self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
+            self.A = linop.ArrayToBlocks(shape, blk_shape, blk_strides)
+            self.Reshape = self._linop_reshape(self.A)
 
-        if self.contrast_step_size is not None:
+            self.Fwd = self.Reshape * self.A * self.RandShift
             if self.windows_per_echo % self.contrast_step_stride != 0:
                 self.RandShift2 = self._linop_randshift(shape2, blk_shape, randshift)
                 self.A2= linop.ArrayToBlocks(shape2, blk_shape, blk_strides)
                 self.Reshape2 = self._linop_reshape(self.A2)
 
                 self.Fwd2 = self.Reshape2 * self.A2 * self.RandShift2
+        else:
+            self.Fwd = []
+            for i in range(self.contrast_mask.shape[1]):
+                print(shape[i])
+                RandShift = self._linop_randshift(shape[i], blk_shape, randshift)
+                A = linop.ArrayToBlocks(shape[i], blk_shape, blk_strides)
+                Reshape = self._linop_reshape(A)
+
+                self.Fwd.append(Reshape * A * RandShift)
 
         super().__init__(shape)
 
@@ -710,7 +735,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
                 if n_slice >= (self.n_slice//2 - self.slices_around_center) and n_slice < (self.n_slice//2 + self.slices_around_center):
                     #takes time
-                    if self.contrast_step_size is None:
+                    if self.contrast_step_size is None and self.use_contrast_mask == False:
                         output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
                         # print("SVD computation")
                         # print(">>> shape of the array for SVD: ", output.shape)
@@ -806,22 +831,28 @@ class LLRL1Reg_3d_Rad(Prox):
                         output[...,self.slice_y, self.slice_x] = output_LLR
                     else:
                         # sliding window on contrast dimension
-                        full_steps = mag.shape[0]
-                        N_contrast_windows = self.windows_per_echo // self.contrast_step_stride + (self.windows_per_echo % self.contrast_step_stride != 0) - (self.contrast_step_stride == 1)
-                        shortened_window = False
-                        if self.windows_per_echo % self.contrast_step_stride != 0:
-                            shortened_window = True
+                        if self.use_contrast_mask:
+                            N_contrast_windows = self.contrast_mask.shape[1]
+                        else:
+                            N_contrast_windows = self.windows_per_echo // self.contrast_step_stride + (self.windows_per_echo % self.contrast_step_stride != 0) - (self.contrast_step_stride == 1)
+                            shortened_window = False
+                            if self.windows_per_echo % self.contrast_step_stride != 0:
+                                shortened_window = True
                         final_output = mag[...,n_slice:n_slice+self.n_slice_chunk,:,:]
 
                         for w in range(N_contrast_windows):
                             
-                            if w == N_contrast_windows-1 and shortened_window:
-                                sliced_mag = self.getContrastSlicedMag(mag=mag, start_idx=w*self.contrast_step_stride, xp=xp, shortened_window=self.windows_per_echo % self.contrast_step_stride)
-                                # print(sliced_mag.shape)
-                                output = self.Fwd2(sliced_mag[...,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
+                            if self.use_contrast_mask:
+                                sliced_mag = mag[self.contrast_mask[:,w],...,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x]
+                                output = self.Fwd[w](sliced_mag)
                             else:
-                                sliced_mag = self.getContrastSlicedMag(mag=mag, start_idx=w*self.contrast_step_stride, xp=xp)
-                                output = self.Fwd(sliced_mag[...,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
+                                if w == N_contrast_windows-1 and shortened_window:
+                                    sliced_mag = self.getContrastSlicedMag(mag=mag, start_idx=w*self.contrast_step_stride, xp=xp, shortened_window=self.windows_per_echo % self.contrast_step_stride)
+                                    # print(sliced_mag.shape)
+                                    output = self.Fwd2(sliced_mag[...,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
+                                else:
+                                    sliced_mag = self.getContrastSlicedMag(mag=mag, start_idx=w*self.contrast_step_stride, xp=xp)
+                                    output = self.Fwd(sliced_mag[...,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
                             # print(">> Processing contrast window {}/{}".format(w+1, N_contrast_windows))
                             # print("SVD computation")
                             # print(">>> shape of the array for SVD: ", output.shape)
@@ -866,13 +897,16 @@ class LLRL1Reg_3d_Rad(Prox):
                                 output[patch_start:patch_end, ...] = backend.to_device(output_part, device=device)
 
                             
-
-                            if w == N_contrast_windows-1 and shortened_window:
-                                output_LLR = self.Fwd2.H(output)
-                                final_output = self.sortSlicedIntoFinalOut(final_output=final_output, LLR_output=output_LLR, start_idx=w*self.contrast_step_stride, shortened_window=self.windows_per_echo % self.contrast_step_stride)
+                            if self.use_contrast_mask:
+                                output_LLR = self.Fwd[w].H(output)
+                                final_output[self.contrast_mask[:,w],...,self.slice_y,self.slice_x] = output_LLR
                             else:
-                                output_LLR = self.Fwd.H(output)
-                                final_output = self.sortSlicedIntoFinalOut(final_output=final_output, LLR_output=output_LLR, start_idx=w*self.contrast_step_stride)
+                                if w == N_contrast_windows-1 and shortened_window:
+                                    output_LLR = self.Fwd2.H(output)
+                                    final_output = self.sortSlicedIntoFinalOut(final_output=final_output, LLR_output=output_LLR, start_idx=w*self.contrast_step_stride, shortened_window=self.windows_per_echo % self.contrast_step_stride)
+                                else:
+                                    output_LLR = self.Fwd.H(output)
+                                    final_output = self.sortSlicedIntoFinalOut(final_output=final_output, LLR_output=output_LLR, start_idx=w*self.contrast_step_stride)
 
                         output = final_output
 
