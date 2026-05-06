@@ -555,7 +555,11 @@ class LLRL1Reg_3d_Rad(Prox):
         else:
             slice_x = slice(0, ishape[-2])
             slice_y = slice(0, ishape[-1])
-        self.n_slice_chunk = self.blk_shape[0]
+        
+        if self.blk_shape[0] > 1:
+            self.n_slice_chunk = ishape[-3]
+        else:
+            self.n_slice_chunk = self.blk_shape[0]
         
         # print(shape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start])
         if self.contrast_step_size is None and not use_contrast_mask:
@@ -583,6 +587,9 @@ class LLRL1Reg_3d_Rad(Prox):
             self.Reshape = self._linop_reshape(self.A)
 
             self.Fwd = self.Reshape * self.A * self.RandShift
+
+            print(">> FWD oshape: ", self.Fwd.oshape)
+            print(">> FWD ishape: ", self.Fwd.ishape)
 
         elif self.contrast_step_size is not None and not use_contrast_mask:
             self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
@@ -735,6 +742,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
                 if n_slice >= (self.n_slice//2 - self.slices_around_center) and n_slice < (self.n_slice//2 + self.slices_around_center):
                     #takes time
+                    # print(">> Applying LLR on central slices")
                     if self.contrast_step_size is None and self.use_contrast_mask == False:
                         output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
                         # print("SVD computation")
@@ -827,6 +835,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
 
                         output_LLR = self.Fwd.H(output)
+                        # print(">> LLR output shape: ", output_LLR.shape)
                         output = mag[:,:,n_slice:n_slice+self.n_slice_chunk,...]    #extend FOV if bounding_box is used with original data
                         output[...,self.slice_y, self.slice_x] = output_LLR
                     else:
@@ -898,6 +907,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
                             
                             if self.use_contrast_mask:
+                                # print(">> writing output into mag")
                                 output_LLR = self.Fwd[w].H(output)
                                 final_output[self.contrast_mask[:,w],...,self.slice_y,self.slice_x] = output_LLR
                             else:
@@ -909,6 +919,7 @@ class LLRL1Reg_3d_Rad(Prox):
                                     final_output = self.sortSlicedIntoFinalOut(final_output=final_output, LLR_output=output_LLR, start_idx=w*self.contrast_step_stride)
 
                         output = final_output
+                        # print(">> LLR output shape: ", output.shape)
 
                             
                 else:
