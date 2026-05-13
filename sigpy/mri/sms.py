@@ -14,7 +14,13 @@ __all__ = ['get_uncollap_slice_idx',
 
 
 def is_even(input):
-    return (input % 2 ==0)
+    return (input % 2 == 0)
+
+def is_odd(input):
+    return (input % 2 == 1)
+
+def is_odd(input):
+    return (input % 2 ==1)
 
 
 def map_acquire_to_ordered_slice_idx(acq_slice_idx,
@@ -41,11 +47,18 @@ def map_acquire_to_ordered_slice_idx(acq_slice_idx,
     for b in range(N_band):
 
         # interleaved slice order
-        if (acq_slice_idx >= N_slices_collap_half) and \
-            (is_even(N_slices_collap)):
+        if ((acq_slice_idx >= N_slices_collap_half) and \
+            (is_even(N_slices_collap))): # or (is_odd(N_slices_uncollap) and N_band==1):
             so = acq_slice_idx * 2
         else:
             so = acq_slice_idx * 2 + 1
+
+        # if is_odd(N_slices_uncollap) and N_band == 1:
+        #     if (acq_slice_idx > N_slices_collap_half) and \
+        #         (is_even(N_slices_collap)):
+        #         so = acq_slice_idx * 2 + 1
+        #     else:
+        #         so = acq_slice_idx * 2
 
         so = (so + b * N_slices_collap) % N_slices_uncollap
         ord_slice_idx.append(so)

@@ -292,7 +292,7 @@ class Exponential(Nlop):
             dx = xp.sum(JH * dy, axis=1)
 
             if self.rvc:
-                dx = dx.real + 0. * 1j
+                dx[-1, ...] = dx[-1, ...].real + 0. * 1j
 
             return dx
 
