@@ -555,6 +555,7 @@ class LLRL1Reg_3d_Rad(Prox):
         else:
             slice_x = slice(0, ishape[-2])
             slice_y = slice(0, ishape[-1])
+        
         self.n_slice_chunk = self.blk_shape[0]
         
         # print(shape[0:2] + [self.n_slice_chunk] + [slice_y.stop - slice_y.start, slice_x.stop - slice_x.start])
@@ -572,44 +573,44 @@ class LLRL1Reg_3d_Rad(Prox):
         
         
         #print(shape)
+        self.shape = shape
         self.slice_x = slice_x
         self.slice_y = slice_y
         
-        # print("Shape: ", shape)
-        # print("blk_shape", blk_shape)
-        if self.contrast_step_size is None and not use_contrast_mask:
-            self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
-            self.A = linop.ArrayToBlocks(shape, blk_shape, blk_strides)
+        self._construct_FWD()
+
+        super().__init__(shape)
+
+    def _check_blk(self):
+        assert len(self.blk_shape) == len(self.blk_strides)
+    
+    def _construct_FWD(self):
+        if self.contrast_step_size is None and not self.use_contrast_mask:
+            self.RandShift = self._linop_randshift(self.shape, self.blk_strides, self.randshift)
+            self.A = linop.ArrayToBlocks(self.shape, self.blk_shape, self.blk_strides)
             self.Reshape = self._linop_reshape(self.A)
 
             self.Fwd = self.Reshape * self.A * self.RandShift
-
-        elif self.contrast_step_size is not None and not use_contrast_mask:
-            self.RandShift = self._linop_randshift(shape, blk_shape, randshift)
-            self.A = linop.ArrayToBlocks(shape, blk_shape, blk_strides)
+        elif self.contrast_step_size is not None and not self.use_contrast_mask:
+            self.RandShift = self._linop_randshift(self.shape, self.blk_shape, self.randshift)
+            self.A = linop.ArrayToBlocks(self.shape, self.blk_shape, self.blk_strides)
             self.Reshape = self._linop_reshape(self.A)
 
             self.Fwd = self.Reshape * self.A * self.RandShift
             if self.windows_per_echo % self.contrast_step_stride != 0:
-                self.RandShift2 = self._linop_randshift(shape2, blk_shape, randshift)
-                self.A2= linop.ArrayToBlocks(shape2, blk_shape, blk_strides)
+                self.RandShift2 = self._linop_randshift(self.shape, self.blk_shape, self.randshift)
+                self.A2= linop.ArrayToBlocks(self.shape, self.blk_shape, self.blk_strides)
                 self.Reshape2 = self._linop_reshape(self.A2)
 
                 self.Fwd2 = self.Reshape2 * self.A2 * self.RandShift2
         else:
             self.Fwd = []
             for i in range(self.contrast_mask.shape[1]):
-                print(shape[i])
-                RandShift = self._linop_randshift(shape[i], blk_shape, randshift)
-                A = linop.ArrayToBlocks(shape[i], blk_shape, blk_strides)
+                RandShift = self._linop_randshift(self.shape[i], self.blk_strides, self.randshift)
+                A = linop.ArrayToBlocks(self.shape[i], self.blk_shape, self.blk_strides)
                 Reshape = self._linop_reshape(A)
 
                 self.Fwd.append(Reshape * A * RandShift)
-
-        super().__init__(shape)
-
-    def _check_blk(self):
-        assert len(self.blk_shape) == len(self.blk_strides)
 
     def getContrastSlicedMag(self, mag, start_idx, xp, shortened_window=None):
         # print(">> get corresponding mag")
@@ -721,20 +722,17 @@ class LLRL1Reg_3d_Rad(Prox):
                 phs = xp.ones_like(mag)
 
             #FIXME: transposing not necessary for other reconstruction
-            mag = xp.transpose(mag, (0,1,4,3,2))  # [n_slice, N_diff, N_shot, N_y, N_x]
-            # print("Mag shape after transpose: ", mag.shape)
+            mag = xp.transpose(mag, (0,1,4,3,2)) # make slices appear in last dim
 
-            # import h5py
-            # with h5py.File(r'C:\Workspace\Temp_dir\RSR_LLR\meas_MID00180_FID03255_Multi_SlidingWindow_1000mum_20k.dat_reconstructed_steps_2_ADMM_total_it_5_lambda_0.001.h5', 'r+') as f:
-            #     f.create_dataset(f'mag_iter_{self.iter}', data=backend.to_device(mag))
-            # print("Mag shape: ", mag.shape)
+            #Update Fwd to make use of randshift
+            if self.randshift:
+                self._construct_FWD()
             
-            for n_slice in range(0,self.n_slice, self.n_slice_chunk):
-
-                # print(f">> LLR on slice {n_slice} of {self.n_slice}")
+            for n_slice in range(0,self.n_slice-self.n_slice_chunk+1, self.blk_strides[0]):
 
                 if n_slice >= (self.n_slice//2 - self.slices_around_center) and n_slice < (self.n_slice//2 + self.slices_around_center):
                     #takes time
+                    # print(">> Applying LLR on central slices")
                     if self.contrast_step_size is None and self.use_contrast_mask == False:
                         output = self.Fwd(mag[:,:,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x])
                         # print("SVD computation")
@@ -827,6 +825,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
 
                         output_LLR = self.Fwd.H(output)
+                        # print(">> LLR output shape: ", output_LLR.shape)
                         output = mag[:,:,n_slice:n_slice+self.n_slice_chunk,...]    #extend FOV if bounding_box is used with original data
                         output[...,self.slice_y, self.slice_x] = output_LLR
                     else:
@@ -840,7 +839,8 @@ class LLRL1Reg_3d_Rad(Prox):
                                 shortened_window = True
                         final_output = mag[...,n_slice:n_slice+self.n_slice_chunk,:,:]
 
-                        for w in range(N_contrast_windows):
+                        # for w in range(N_contrast_windows):
+                        for w in range(1):
                             
                             if self.use_contrast_mask:
                                 sliced_mag = mag[self.contrast_mask[:,w],...,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x]
@@ -898,6 +898,7 @@ class LLRL1Reg_3d_Rad(Prox):
 
                             
                             if self.use_contrast_mask:
+                                # print(">> writing output into mag")
                                 output_LLR = self.Fwd[w].H(output)
                                 final_output[self.contrast_mask[:,w],...,self.slice_y,self.slice_x] = output_LLR
                             else:
@@ -909,6 +910,7 @@ class LLRL1Reg_3d_Rad(Prox):
                                     final_output = self.sortSlicedIntoFinalOut(final_output=final_output, LLR_output=output_LLR, start_idx=w*self.contrast_step_stride)
 
                         output = final_output
+                        # print(">> LLR output shape: ", output.shape)
 
                             
                 else:
@@ -923,13 +925,13 @@ class LLRL1Reg_3d_Rad(Prox):
 
             return mag * phs
 
-    def _linop_randshift(self, shape, blk_shape, randshift):
+    def _linop_randshift(self, shape, blk_stride, randshift):
 
-        D = len(blk_shape)
+        D = len(blk_stride)
 
         if randshift is True:
             axes = range(-D, 0)
-            shift = [random.randint(0, blk_shape[s]) for s in axes]
+            shift = [random.randint(0, blk_stride[s]) for s in axes]
 
             return linop.Circshift(shape, shift, axes)
         else:

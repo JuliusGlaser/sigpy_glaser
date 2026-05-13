@@ -625,6 +625,7 @@ def _get_regularization(ishape, regu='TIK', lamda=0,
                         regu_axes=[-2, -1],
                         blk_shape=(8, 8),
                         blk_strides=(8, 8),
+                        randshift=True,
                         slices_around_center=0,
                         con_step = None,
                         con_stride = None,
@@ -694,12 +695,13 @@ def _get_regularization(ishape, regu='TIK', lamda=0,
         blk_strides = list(blk_strides)
 
         for ind in range(len(blk_shape)):
-            if ishape[ind-2] <= blk_shape[ind-2]:
-                blk_shape[ind-2] = ishape[ind-2] // 3
-                blk_strides[ind-2] = ishape[ind-2] // 3
+            if ishape[ind-len(blk_shape)] <= blk_shape[ind-len(blk_shape)]:
+                blk_shape[ind-len(blk_shape)] = ishape[ind-len(blk_shape)] // 3
+                blk_strides[ind-len(blk_shape)] = ishape[ind-len(blk_shape)] // 3
 
         proxg = sp.prox.LLRL1Reg_3d_Rad(trafos.oshape, lamda,
                                         blk_shape=blk_shape,
+                                        randshift=randshift,
                                         blk_strides=blk_strides,
                                         slices_around_center=slices_around_center,
                                         contrast_step_size=con_step, 
