@@ -93,10 +93,13 @@ class NonLinearLeastSquares(alg.Alg):
 
             self.p = self.A.adjoint(self.x, self.r)
 
+            print("Adjoint done")
+
             self.p += self.alpha * (self.x0 - self.x)
 
             # update dx
             self.lls()
+            print("Inner iter done")
 
             self.x += 1. * self.dx
 
@@ -129,6 +132,7 @@ class NonLinearLeastSquares(alg.Alg):
                 AHA_L2 = lambda x: AHA(x) + self.alpha * x
                 alg_lls = alg.ConjugateGradient(AHA_L2, self.p, self.dx, max_iter=self.inner_iter, tol=tol)
                 while not alg_lls.done():
+                    print("  inner iter: " + "%3d"%(alg_lls.iter) + "; resid: " + "%4.6f"%(alg_lls.resid))
                     alg_lls.update()
 
             else:

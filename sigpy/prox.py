@@ -770,6 +770,7 @@ class LLRL1Reg_3d_Rad(Prox):
                                     s = s / self.blk_shape[-1]
 
                                 s_thresh = thresh.soft_thresh(self.lamda * alpha, s)
+                                # s_thresh = thresh.hard_thresh(self.lamda * alpha, s)
 
                                 if self.normalization:
                                     s_thresh = s_thresh * self.blk_shape[-1]
@@ -839,8 +840,8 @@ class LLRL1Reg_3d_Rad(Prox):
                                 shortened_window = True
                         final_output = mag[...,n_slice:n_slice+self.n_slice_chunk,:,:]
 
-                        # for w in range(N_contrast_windows):
-                        for w in range(1):
+                        for w in range(N_contrast_windows):
+                        # for w in range(1):
                             
                             if self.use_contrast_mask:
                                 sliced_mag = mag[self.contrast_mask[:,w],...,n_slice:n_slice+self.n_slice_chunk,self.slice_y,self.slice_x]

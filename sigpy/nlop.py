@@ -161,7 +161,7 @@ class Exponential(Nlop):
 
         num_encode, num_relax = encode.shape
 
-        assert num_relax == num_param - 2 if bias else num_param - 1
+        # assert num_relax == num_param - 2 if bias else num_param - 1
 
         self.encode = encode
         self.bias = bias

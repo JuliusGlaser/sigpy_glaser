@@ -23,6 +23,7 @@ class kinv(nlls.NonLinearLeastSquares):
                  trafos=None, proxf=None,
                  inner_iter=100, inner_tol=0.01,
                  scaling=False,
+                 fat_peaks=None, echo_times=None, gradient_times=None, field_strength=None,
                  **kwargs):
 
         y = sp.to_device(y, device=device)
@@ -37,6 +38,19 @@ class kinv(nlls.NonLinearLeastSquares):
             if x is None:
                 with device:
                     x = xp.ones(A.ishape) * 0.1
+        
+        elif model == 'FatWater':
+            print(coil.shape)
+            A = nlop.FatWaterReco( image_shape, coil,
+                                    fat_peaks = fat_peaks, 
+                                    echo_times = echo_times, 
+                                    gradient_times = gradient_times,
+                                    field_strength = field_strength,
+                                    coord=coord)
+
+            if x is None:
+                with device:
+                    x = xp.ones(A.ishape, dtype=y.dtype) * 0.1
 
         elif model == 'Diffusion':
             # estimate coil
